@@ -1,0 +1,9 @@
+sentence-transformers
+transformers
+torch
+sentencepiece
+numpy
+pandas
+chromadb
+deep-translator
+mysql-connector-python

@@ -1,0 +1,9 @@
+node_modules
+frontend/node_modules
+test-results
+playwright-report
+.git
+.github
+__pycache__
+*.pyc
+data/chatbot_app.sqlite3
