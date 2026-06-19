@@ -30,6 +30,14 @@ banking_chatbot/
 
 ## Run the backend API
 
+Copy the environment template once for local development:
+
+```powershell
+copy .env.example .env
+```
+
+Then edit `.env` if your MySQL username, password, host, or database name is different.
+
 ```powershell
 cd C:\Users\drjha\banking_chatbot
 python app.py
@@ -90,4 +98,34 @@ $env:DATABASE_BACKEND="sqlite"
 $env:SQLITE_DB_PATH="C:\Users\drjha\banking_chatbot\data\chatbot_app.sqlite3"
 $env:OPEN_BROWSER="0"
 python app.py
+```
+
+## Environment variables and secrets
+
+Do not commit real `.env` files. Commit only `.env.example`.
+
+For GitHub Secrets or hosting provider secrets, add either `MYSQL_URL`:
+
+```text
+MYSQL_URL=mysql://USERNAME:PASSWORD@HOST:3306/DATABASE_NAME
+```
+
+or add the separate values:
+
+```text
+MYSQL_HOST=localhost
+MYSQL_PORT=3306
+MYSQL_USER=root
+MYSQL_PASSWORD=root123
+MYSQL_DATABASE=banking_chatbot_db
+```
+
+Other supported variables:
+
+```text
+HOST=127.0.0.1
+PORT=8000
+OPEN_BROWSER=1
+DATABASE_BACKEND=mysql
+SQLITE_DB_PATH=data/chatbot_app.sqlite3
 ```

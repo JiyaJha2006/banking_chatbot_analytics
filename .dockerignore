@@ -6,4 +6,7 @@ playwright-report
 .github
 __pycache__
 *.pyc
+.env
+.env.*
+*.env
 data/chatbot_app.sqlite3
