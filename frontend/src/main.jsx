@@ -9,6 +9,7 @@ const ACTIVE_CHAT_KEY = "banking-chat-active";
 const SIDEBAR_KEY = "banking-chat-sidebar-collapsed";
 const AUTH_KEY = "banking-chat-auth";
 const TOKEN_KEY = "banking-chat-token";
+const TOKEN_EXPIRES_KEY = "banking-chat-token-expires-at";
 const PAGE_ROUTES = {
   login: "/login",
   signup: "/signup",
@@ -95,13 +96,26 @@ function getStoredToken() {
   return localStorage.getItem(TOKEN_KEY) || "";
 }
 
+function getStoredTokenExpiresAt() {
+  return localStorage.getItem(TOKEN_EXPIRES_KEY) || "";
+}
+
+function isStoredTokenExpired() {
+  const expiresAt = getStoredTokenExpiresAt();
+  if (!expiresAt) return false;
+  const expiresAtMs = Date.parse(expiresAt);
+  return Number.isFinite(expiresAtMs) && expiresAtMs <= Date.now();
+}
+
 function getAuthHeaders() {
   const token = getStoredToken();
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
 function getUserStorageId(user) {
-  return user?.id ? `user-${user.id}` : "";
+  if (!user?.id || !user?.username) return "";
+  const safeUsername = String(user.username).trim().toLowerCase().replace(/[^a-z0-9_-]/g, "-");
+  return `user-${user.id}-${safeUsername}`;
 }
 
 function getUserChatsKey(user) {
@@ -201,7 +215,7 @@ const profileCopy = {
   }
 };
 
-function ProfilePage({ authUser, language }) {
+function ProfilePage({ authUser, language, onAuthExpired }) {
   const [profile, setProfile] = useState(null);
   const [error, setError] = useState("");
   const p = profileCopy[language] || profileCopy.English;
@@ -214,11 +228,15 @@ function ProfilePage({ authUser, language }) {
     })
       .then(async (response) => {
         const data = await response.json();
+        if (response.status === 401) {
+          onAuthExpired?.();
+          return null;
+        }
         if (!response.ok) throw new Error(data.error || p.error);
         return data.profile;
       })
       .then((data) => {
-        if (isCurrent) setProfile(data);
+        if (isCurrent && data) setProfile(data);
       })
       .catch(() => {
         if (isCurrent) setError(p.error);
@@ -325,7 +343,7 @@ function AnalyticsBarChart({ title, rows = [], emptyText = "No analytics yet." }
   );
 }
 
-function AnalyticsPage({ language }) {
+function AnalyticsPage({ language, onAuthExpired }) {
   const [analytics, setAnalytics] = useState(null);
   const [error, setError] = useState("");
   const a = analyticsCopy[language] || analyticsCopy.English;
@@ -336,11 +354,15 @@ function AnalyticsPage({ language }) {
     fetch("/api/analytics", { headers: getAuthHeaders() })
       .then(async (response) => {
         const data = await response.json();
+        if (response.status === 401) {
+          onAuthExpired?.();
+          return null;
+        }
         if (!response.ok) throw new Error(data.error || a.error);
         return data.analytics;
       })
       .then((data) => {
-        if (isCurrent) setAnalytics(data);
+        if (isCurrent && data) setAnalytics(data);
       })
       .catch(() => {
         if (isCurrent) setError(a.error);
@@ -566,7 +588,7 @@ function App() {
   useEffect(() => {
     if (!authUser) return;
     const token = getStoredToken();
-    if (!token) {
+    if (!token || isStoredTokenExpired()) {
       handleLogout();
       navigateTo(PAGE_ROUTES.login);
       return;
@@ -579,6 +601,19 @@ function App() {
         handleLogout();
         navigateTo(PAGE_ROUTES.login);
       });
+  }, [authUser?.id]);
+
+  useEffect(() => {
+    if (!authUser) return;
+    const checkToken = () => {
+      if (isStoredTokenExpired()) {
+        handleLogout();
+        navigateTo(PAGE_ROUTES.login);
+      }
+    };
+    checkToken();
+    const timer = window.setInterval(checkToken, 60000);
+    return () => window.clearInterval(timer);
   }, [authUser?.id]);
 
   useEffect(() => {
@@ -620,6 +655,7 @@ function App() {
   function handleLogin(user) {
     const { token, token_type, expires_at, expires_in_seconds, ...storedUser } = user;
     if (token) localStorage.setItem(TOKEN_KEY, token);
+    if (expires_at) localStorage.setItem(TOKEN_EXPIRES_KEY, expires_at);
     localStorage.setItem(AUTH_KEY, JSON.stringify(storedUser));
     const userChats = loadChatsForUser(storedUser);
     setAuthUser(storedUser);
@@ -642,12 +678,18 @@ function App() {
     }
     localStorage.removeItem(AUTH_KEY);
     localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(TOKEN_EXPIRES_KEY);
     setAuthUser(null);
     const emptyChat = createChat();
     setChats([emptyChat]);
     setActiveChatId(emptyChat.id);
     setSearchTerm("");
     setInput("");
+  }
+
+  function handleAuthExpired() {
+    handleLogout();
+    navigateTo(PAGE_ROUTES.login);
   }
 
   function updateActiveChat(updater) {
@@ -741,6 +783,10 @@ function App() {
         })
       });
       const data = await response.json();
+      if (response.status === 401) {
+        handleAuthExpired();
+        return;
+      }
       if (!response.ok) throw new Error(data.error || "Backend error");
       setChats((current) => current.map((chat) => (
         chat.id === activeChat.id ? { ...chat, backendSessionId: data.session_id || chat.backendSessionId } : chat
@@ -876,9 +922,9 @@ function App() {
         </header>
 
         {activeView === "profile" ? (
-          <ProfilePage authUser={authUser} language={language} />
+          <ProfilePage authUser={authUser} language={language} onAuthExpired={handleAuthExpired} />
         ) : activeView === "analytics" ? (
-          <AnalyticsPage language={language} />
+          <AnalyticsPage language={language} onAuthExpired={handleAuthExpired} />
         ) : (
           <>
             <section ref={scrollRef} className="conversation" aria-live="polite">
