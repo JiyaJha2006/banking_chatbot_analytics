@@ -1,10 +1,13 @@
 ﻿from __future__ import annotations
 
+import json
 import uuid
 import re
 from difflib import SequenceMatcher, get_close_matches
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 import chromadb
 from deep_translator import GoogleTranslator
@@ -465,32 +468,110 @@ def is_banking_related_question(question, session):
     return bool(session.get("current_topic") and is_follow_up_question(text))
 
 
+def is_general_factual_question(message):
+    text = message.lower().strip()
+    return bool(re.match(
+        r"^(what|who|where|when|why|which|how many|how much|name|tell me (what|who|where|when))\b",
+        text,
+    )) or text.endswith("?")
+
+
+def retrieve_general_knowledge_context(question):
+    params = urlencode({
+        "action": "query",
+        "generator": "search",
+        "gsrsearch": question,
+        "gsrlimit": 3,
+        "prop": "extracts",
+        "exintro": 1,
+        "explaintext": 1,
+        "exchars": 800,
+        "redirects": 1,
+        "format": "json",
+    })
+    request = Request(
+        f"https://en.wikipedia.org/w/api.php?{params}",
+        headers={"User-Agent": "BankingChatbotAnalytics/1.0 (educational project)"},
+    )
+    try:
+        with urlopen(request, timeout=8) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return ""
+    pages = list(payload.get("query", {}).get("pages", {}).values())
+    pages.sort(key=lambda page: page.get("index", 999))
+    context_parts = []
+    for page in pages:
+        title = str(page.get("title", "")).strip()
+        extract = " ".join(str(page.get("extract", "")).split())
+        if title and extract:
+            context_parts.append(f"{title}: {extract}")
+    return "\n".join(context_parts)[:2400]
+
+
+def extract_direct_general_fact(question, context):
+    capital_match = re.search(r"\bcapital of ([a-z][a-z .'-]+?)(?:\?|$)", question.lower().strip())
+    if not capital_match:
+        return ""
+    place = " ".join(capital_match.group(1).split())
+    escaped_place = re.escape(place)
+    place_pattern = rf"(?i:{escaped_place})"
+    patterns = [
+        rf"\b([A-Z][a-zA-Z.'-]+(?:\s+[A-Z][a-zA-Z.'-]+){{0,3}}), the capital of {place_pattern}\b",
+        rf"\b([A-Z][a-zA-Z.'-]+(?:\s+[A-Z][a-zA-Z.'-]+){{0,3}}) is the capital of {place_pattern}\b",
+        rf"\bthe capital of {place_pattern} is ([A-Z][a-zA-Z.'-]+(?:\s+[A-Z][a-zA-Z.'-]+){{0,3}})\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, context)
+        if match:
+            capital = " ".join(word.capitalize() for word in match.group(1).split())
+            return f"The capital of {place.title()} is {capital}."
+    return ""
+
+
 def generate_general_llm_response(message, session, tokenizer, llm_model, language):
     language_instruction = "Respond in simple Hindi." if language == "Hindi" else "Respond in natural English."
-    history = build_recent_chat_history(session)
-    prompt = f"""
-You are a friendly and helpful conversational assistant inside a banking application.
-{language_instruction}
-Respond naturally to the user's casual or general message.
-For greetings, greet the user back warmly and briefly.
-For general questions, answer directly if you know the answer.
-Do not force the conversation to be about banking.
-Do not claim to have performed actions you cannot perform.
-
-Recent conversation:
-{history}
-
+    is_greeting = bool(re.search(r"\b(hello|hi|hey|good morning|good afternoon|good evening)\b", message.lower()))
+    factual_context = ""
+    if is_greeting:
+        prompt = f"""
+You are a friendly conversational assistant. {language_instruction}
+Reply to the greeting warmly in one short sentence.
 User: {message}
 Assistant:
 """
-    inputs = tokenizer(prompt, return_tensors="pt", max_length=512, truncation=True)
+    else:
+        factual_question = is_general_factual_question(message)
+        factual_context = retrieve_general_knowledge_context(message) if factual_question else ""
+        if factual_question and not factual_context:
+            return "I could not verify that fact right now, so I do not want to guess.", ["llm"]
+        direct_fact = extract_direct_general_fact(message, factual_context)
+        if direct_fact:
+            return direct_fact, ["wikipedia", "fact_extraction"]
+        prompt = f"""
+You are a precise general-knowledge question answering assistant.
+{language_instruction}
+Question: {message}
+
+Give the standard accepted factual answer in one or two short sentences.
+Read every word carefully and answer only from the reference context below.
+For geography, distinguish an official capital from a largest or most famous city.
+If the reference does not contain the answer, say that you could not verify it instead of guessing.
+Do not force the answer to be about banking.
+
+Reference context:
+{factual_context}
+Answer:
+"""
+    inputs = tokenizer(prompt, return_tensors="pt", max_length=768, truncation=True)
     outputs = llm_model.generate(**inputs, max_new_tokens=96, num_beams=3, do_sample=False)
     answer = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
     if not answer or answer.lower() == message.lower() or "clarify" in answer.lower():
-        if re.search(r"\b(hello|hi|hey|good morning|good afternoon|good evening)\b", message.lower()):
-            return "Hello! How can I help you today?"
-        return "I understand. How can I help you with that?"
-    return answer
+        if is_greeting:
+            return "Hello! How can I help you today?", ["llm"]
+        return "I could not produce a verified answer from the available reference.", ["wikipedia", "llm"]
+    methods = ["wikipedia", "llm"] if factual_context else ["llm"]
+    return answer, methods
 
 
 def rewrite_unclear_question(question, session, tokenizer, llm_model):
@@ -1244,7 +1325,7 @@ def answer_message(message, language="English", session_id=None):
     embedding_model, reranker_model, tokenizer, llm_model = load_models()
 
     if not is_banking_related_question(search_question, session):
-        reply = generate_general_llm_response(message, session, tokenizer, llm_model, language)
+        reply, general_methods = generate_general_llm_response(message, session, tokenizer, llm_model, language)
         session["chat_history"].append({"role": "bot", "message": reply})
         return {
             "session_id": session_id,
@@ -1254,7 +1335,7 @@ def answer_message(message, language="English", session_id=None):
             "suggested_questions": translate_suggested_questions(build_suggested_questions(), language),
             "topic": "general conversation",
             "general_chat": True,
-            "search_methods": ["llm"],
+            "search_methods": general_methods,
         }
 
     banking_collection, _ = load_vector_db()

@@ -220,7 +220,7 @@ def signup_user(username: str, password: str):
         cursor.close()
         conn.close()
 
-    user = {"id": user_id, "username": username}
+    user = {"id": user_id, "username": username, "is_new_user": True}
     return {**user, **create_auth_token(user_id)}
 
 
@@ -254,7 +254,7 @@ def signin_user(username: str, password: str):
     cursor.close()
     conn.close()
     auth_token = create_auth_token(user["id"])
-    return {"id": user["id"], "username": user["username"], **auth_token}
+    return {"id": user["id"], "username": user["username"], "is_new_user": False, **auth_token}
 
 
 def log_question(user_id, username: str, question: str, language: str, session_id=None, topic=None, response_time_ms=None):

@@ -653,10 +653,14 @@ function App() {
   }, [authUser, routePath, chats]);
 
   function handleLogin(user) {
-    const { token, token_type, expires_at, expires_in_seconds, ...storedUser } = user;
+    const { token, token_type, expires_at, expires_in_seconds, is_new_user, ...storedUser } = user;
     if (token) localStorage.setItem(TOKEN_KEY, token);
     if (expires_at) localStorage.setItem(TOKEN_EXPIRES_KEY, expires_at);
     localStorage.setItem(AUTH_KEY, JSON.stringify(storedUser));
+    if (is_new_user) {
+      localStorage.removeItem(getUserChatsKey(storedUser));
+      localStorage.removeItem(getUserActiveChatKey(storedUser));
+    }
     const userChats = loadChatsForUser(storedUser);
     setAuthUser(storedUser);
     setChats(userChats);
