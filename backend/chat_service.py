@@ -494,7 +494,7 @@ def retrieve_general_knowledge_context(question):
         headers={"User-Agent": "BankingChatbotAnalytics/1.0 (educational project)"},
     )
     try:
-        with urlopen(request, timeout=8) as response:
+        with urlopen(request, timeout=4) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except Exception:
         return ""
@@ -527,6 +527,37 @@ def extract_direct_general_fact(question, context):
             capital = " ".join(word.capitalize() for word in match.group(1).split())
             return f"The capital of {place.title()} is {capital}."
     return ""
+
+
+def build_general_reference_answer(message, language):
+    text = message.lower().strip()
+    if re.search(r"\b(hello|hi|hey|good morning|good afternoon|good evening)\b", text):
+        answer = "Hello! How can I help you today?"
+        return translate_answer(answer, language), ["conversation"]
+    if re.search(r"\b(how are you|how is it going)\b", text):
+        answer = "I'm doing well, thank you. What would you like to know?"
+        return translate_answer(answer, language), ["conversation"]
+    if re.search(r"\b(thank you|thanks)\b", text):
+        answer = "You're welcome!"
+        return translate_answer(answer, language), ["conversation"]
+
+    context = retrieve_general_knowledge_context(message)
+    if not context:
+        answer = "I couldn't verify that answer right now. Please try rephrasing the question."
+        return translate_answer(answer, language), ["general_reference"]
+
+    direct_fact = extract_direct_general_fact(message, context)
+    if direct_fact:
+        return translate_answer(direct_fact, language), ["wikipedia", "fact_extraction"]
+
+    first_result = context.split("\n", 1)[0]
+    extract = first_result.split(": ", 1)[-1].strip()
+    sentences = re.split(r"(?<=[.!?])\s+", extract)
+    answer = " ".join(sentence for sentence in sentences[:2] if sentence).strip()
+    if not answer:
+        answer = "I couldn't verify that answer right now. Please try rephrasing the question."
+        return translate_answer(answer, language), ["general_reference"]
+    return translate_answer(answer, language), ["wikipedia"]
 
 
 def generate_general_llm_response(message, session, tokenizer, llm_model, language):
@@ -1322,10 +1353,8 @@ def answer_message(message, language="English", session_id=None):
             "topic": recommendation_topic,
         }
 
-    embedding_model, reranker_model, tokenizer, llm_model = load_models()
-
     if not is_banking_related_question(search_question, session):
-        reply, general_methods = generate_general_llm_response(message, session, tokenizer, llm_model, language)
+        reply, general_methods = build_general_reference_answer(message, language)
         session["chat_history"].append({"role": "bot", "message": reply})
         return {
             "session_id": session_id,
@@ -1337,6 +1366,8 @@ def answer_message(message, language="English", session_id=None):
             "general_chat": True,
             "search_methods": general_methods,
         }
+
+    embedding_model, reranker_model, tokenizer, llm_model = load_models()
 
     banking_collection, _ = load_vector_db()
     rewritten_question = ""
