@@ -607,6 +607,16 @@ def retrieve_hybrid_banking_context(
         elif any(SequenceMatcher(None, query.lower(), question).ratio() >= 0.72 for query in query_variants):
             item["methods"].add("fuzzy")
 
+    structured = build_structured_product_candidate(topic, intent)
+    if structured:
+        key = candidate_key(structured)
+        fused[key] = {
+            "metadata": structured,
+            "score": 100.0,
+            "distance": 0.0,
+            "methods": {"structured"},
+        }
+
     ranked = sorted(fused.values(), key=lambda item: item["score"], reverse=True)[:top_k]
     context_parts = []
     sources = []
@@ -725,23 +735,35 @@ def choose_best_answer(user_question, banking_context, reranker_model, intent="g
     for result in banking_context.split("Result "):
         if "Answer:" not in result:
             continue
+        section = ""
         question = ""
         answer = ""
         for line in result.splitlines():
             line = line.strip()
-            if line.startswith("Question:"):
+            if line.startswith("Section:"):
+                section = line.replace("Section:", "").strip()
+            elif line.startswith("Question:"):
                 question = line.replace("Question:", "").strip()
             elif line.startswith("Answer:"):
                 answer = line.replace("Answer:", "").strip()
         if answer:
             text = f"{question} {answer}"
-            candidates.append({"question": question, "answer": answer, "text": text})
+            candidates.append({"section": section, "question": question, "answer": answer, "text": text})
     if not candidates:
         return "I found relevant banking information, but could not extract a clear answer."
 
     topic_candidates = [candidate for candidate in candidates if candidate_matches_topic(topic, candidate["text"])]
     if topic_candidates:
         candidates = topic_candidates
+    elif topic:
+        return f"I could not find a verified answer for {topic}. Please ask about its definition, eligibility, documents, fees, interest, or application process."
+
+    structured_candidates = [
+        candidate for candidate in candidates
+        if candidate["section"].lower() == "structured product reference"
+    ]
+    if structured_candidates and intent in {"definition", "general"}:
+        return structured_candidates[0]["answer"]
 
     intent_candidates = [candidate for candidate in candidates if candidate_matches_intent(intent, candidate["text"])]
     if intent_candidates:
@@ -854,6 +876,31 @@ PRODUCT_FEATURES = {
         "Typical use": "Medical, travel, education, emergency needs",
     },
 }
+
+
+def build_structured_product_candidate(topic, intent):
+    if intent not in {"definition", "general"} or not topic:
+        return None
+    product_name = next(
+        (name for name in PRODUCT_FEATURES if name.lower() == topic.lower()),
+        None,
+    )
+    if not product_name:
+        return None
+    features = PRODUCT_FEATURES[product_name]
+    best_for = features.get("Best for", "banking needs").rstrip(".")
+    typical_use = features.get("Typical use", "").rstrip(".")
+    interest = features.get("Interest", "").rstrip(".")
+    answer = f"A {product_name.lower()} is a banking product used for {best_for.lower()}."
+    if typical_use:
+        answer += f" It is commonly used for {typical_use.lower()}."
+    if interest:
+        answer += f" Its interest arrangement is: {interest.lower()}."
+    return {
+        "section": "structured product reference",
+        "question": f"What is a {product_name.lower()}?",
+        "answer": answer,
+    }
 
 
 def detect_compare_products(question):
@@ -1009,6 +1056,8 @@ def is_generic_help_answer(answer):
 
 def generate_llm_answer(user_question, banking_context, memory_context, recent_chat_history, reranker_model, tokenizer, llm_model, language, intent="general", rerank_query=None, topic=""):
     best_answer = choose_best_answer(user_question, banking_context, reranker_model, intent, rerank_query, topic)
+    if "Section: structured product reference" in banking_context and intent in {"definition", "general"}:
+        return best_answer
     instruction = "Answer in simple Hindi. Use common banking words that Indian users understand." if language == "Hindi" else "Answer in simple English."
     prompt = f"""
 You are a banking assistant.
@@ -1148,7 +1197,7 @@ def answer_message(message, language="English", session_id=None):
         }
 
     embedding_model, reranker_model, tokenizer, llm_model = load_models()
-    banking_collection, memory_collection = load_vector_db()
+    banking_collection, _ = load_vector_db()
 
     rewritten_question = ""
     if question_needs_llm_rewrite(resolved_question, session):
@@ -1183,14 +1232,20 @@ def answer_message(message, language="English", session_id=None):
         embedding_model,
         banking_collection,
     )
-    memory_context = retrieve_chat_memory(search_query, embedding_model, memory_collection)
+    # Chroma chat memory is shared across users, so it must not influence answers.
+    # Session-scoped recent history provides context without cross-account leakage.
+    memory_context = ""
     recent_history = build_recent_chat_history(session)
     reply = generate_llm_answer(message, banking_context, memory_context, recent_history, reranker_model, tokenizer, llm_model, language, intent, search_query, topic)
     reply = translate_answer(reply, language)
 
-    save_chat_memory(message, reply, embedding_model, memory_collection)
     remember_conversation_context(session, topic, intent, resolved_question)
     session["chat_history"].append({"role": "bot", "message": reply})
+    used_search_methods = sorted({
+        method
+        for source in sources
+        for method in source.get("search_methods", [])
+    } | {"cross_encoder"})
 
     return {
         "session_id": session_id,
@@ -1201,5 +1256,5 @@ def answer_message(message, language="English", session_id=None):
         "recommendation_card": recommendation_card,
         "topic": topic,
         "rewritten_question": rewritten_question or None,
-        "search_methods": ["vector", "lexical", "exact", "fuzzy", "cross_encoder"],
+        "search_methods": used_search_methods,
     }
