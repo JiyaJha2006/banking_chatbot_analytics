@@ -448,6 +448,51 @@ def question_needs_llm_rewrite(question, session):
     return question_clarity_score(question, session) < 0.42
 
 
+def is_banking_related_question(question, session):
+    text = question.lower().strip()
+    if extract_topic_from_question(text):
+        return True
+    words = set(re.findall(r"[a-z0-9]+", text))
+    if words & BANKING_VOCABULARY:
+        return True
+    banking_phrases = {
+        "credit score", "bank account", "send money", "receive money",
+        "save money", "borrow money", "monthly instalment", "monthly installment",
+        "account number", "routing number", "ifsc code",
+    }
+    if any(phrase in text for phrase in banking_phrases):
+        return True
+    return bool(session.get("current_topic") and is_follow_up_question(text))
+
+
+def generate_general_llm_response(message, session, tokenizer, llm_model, language):
+    language_instruction = "Respond in simple Hindi." if language == "Hindi" else "Respond in natural English."
+    history = build_recent_chat_history(session)
+    prompt = f"""
+You are a friendly and helpful conversational assistant inside a banking application.
+{language_instruction}
+Respond naturally to the user's casual or general message.
+For greetings, greet the user back warmly and briefly.
+For general questions, answer directly if you know the answer.
+Do not force the conversation to be about banking.
+Do not claim to have performed actions you cannot perform.
+
+Recent conversation:
+{history}
+
+User: {message}
+Assistant:
+"""
+    inputs = tokenizer(prompt, return_tensors="pt", max_length=512, truncation=True)
+    outputs = llm_model.generate(**inputs, max_new_tokens=96, num_beams=3, do_sample=False)
+    answer = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+    if not answer or answer.lower() == message.lower() or "clarify" in answer.lower():
+        if re.search(r"\b(hello|hi|hey|good morning|good afternoon|good evening)\b", message.lower()):
+            return "Hello! How can I help you today?"
+        return "I understand. How can I help you with that?"
+    return answer
+
+
 def rewrite_unclear_question(question, session, tokenizer, llm_model):
     current_topic = session.get("current_topic", "") or "none"
     history = build_recent_chat_history(session)
@@ -1197,8 +1242,22 @@ def answer_message(message, language="English", session_id=None):
         }
 
     embedding_model, reranker_model, tokenizer, llm_model = load_models()
-    banking_collection, _ = load_vector_db()
 
+    if not is_banking_related_question(search_question, session):
+        reply = generate_general_llm_response(message, session, tokenizer, llm_model, language)
+        session["chat_history"].append({"role": "bot", "message": reply})
+        return {
+            "session_id": session_id,
+            "reply": reply,
+            "history": session["chat_history"],
+            "sources": [],
+            "suggested_questions": translate_suggested_questions(build_suggested_questions(), language),
+            "topic": "general conversation",
+            "general_chat": True,
+            "search_methods": ["llm"],
+        }
+
+    banking_collection, _ = load_vector_db()
     rewritten_question = ""
     if question_needs_llm_rewrite(resolved_question, session):
         rewritten_question = rewrite_unclear_question(resolved_question, session, tokenizer, llm_model)
