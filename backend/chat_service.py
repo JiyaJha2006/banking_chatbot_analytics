@@ -606,12 +606,11 @@ Assistant:
     else:
         factual_question = is_general_factual_question(message)
         factual_context = retrieve_general_knowledge_context(message) if factual_question else ""
-        if factual_question and not factual_context:
-            return "I could not verify that fact right now, so I do not want to guess.", ["llm"]
         direct_fact = extract_direct_general_fact(message, factual_context)
         if direct_fact:
             return direct_fact, ["wikipedia", "fact_extraction"]
-        prompt = f"""
+        if factual_context:
+            prompt = f"""
 You are a precise general-knowledge question answering assistant.
 {language_instruction}
 Question: {message}
@@ -626,13 +625,23 @@ Reference context:
 {factual_context}
 Answer:
 """
+        else:
+            prompt = f"""
+Answer this general-knowledge question accurately and briefly.
+{language_instruction}
+Give the standard widely accepted answer in one or two sentences.
+Do not change the topic to banking. Do not repeat the question.
+
+Question: {message}
+Answer:
+"""
     inputs = tokenizer(prompt, return_tensors="pt", max_length=768, truncation=True)
     outputs = llm_model.generate(**inputs, max_new_tokens=96, num_beams=3, do_sample=False)
     answer = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
     if not answer or answer.lower() == message.lower() or "clarify" in answer.lower():
         if is_greeting:
             return "Hello! How can I help you today?", ["llm"]
-        return "I could not produce a verified answer from the available reference.", ["wikipedia", "llm"]
+        return "I could not answer that question clearly. Please try rephrasing it.", ["llm"]
     methods = ["wikipedia", "llm"] if factual_context else ["llm"]
     return answer, methods
 
