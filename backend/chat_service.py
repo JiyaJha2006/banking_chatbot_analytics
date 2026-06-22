@@ -536,6 +536,34 @@ def extract_direct_general_fact(question, context):
     return ""
 
 
+def select_relevant_reference_answer(message, context):
+    query_terms = search_tokens(message)
+    text = " ".join(line.split(": ", 1)[-1] for line in context.splitlines())
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", text)
+        if sentence.strip()
+    ]
+    intent_cues = []
+    lowered = message.lower()
+    if re.search(r"\b(who|invented|inventor|created|discovered|founded)\b", lowered):
+        intent_cues = ["invent", "patent", "created", "discovered", "founded", "credited", "first"]
+    elif re.search(r"\b(when|year|date)\b", lowered):
+        intent_cues = ["year", "date", "century", "founded", "invented", "born"]
+    elif re.search(r"\b(where|location|located)\b", lowered):
+        intent_cues = ["located", "country", "city", "region", "capital"]
+
+    ranked = []
+    for index, sentence in enumerate(sentences):
+        sentence_lower = sentence.lower()
+        overlap = len(query_terms & search_tokens(sentence_lower))
+        cue_score = sum(2 for cue in intent_cues if cue in sentence_lower)
+        ranked.append((overlap * 3 + cue_score, -index, sentence))
+    ranked.sort(reverse=True)
+    selected = [item[2] for item in ranked[:2] if item[0] > 0]
+    return " ".join(selected).strip()
+
+
 def build_general_reference_answer(message, language):
     text = message.lower().strip()
     if re.search(r"\b(hello|hi|hey|good morning|good afternoon|good evening)\b", text):
@@ -557,10 +585,7 @@ def build_general_reference_answer(message, language):
     if direct_fact:
         return translate_answer(direct_fact, language), ["wikipedia", "fact_extraction"]
 
-    first_result = context.split("\n", 1)[0]
-    extract = first_result.split(": ", 1)[-1].strip()
-    sentences = re.split(r"(?<=[.!?])\s+", extract)
-    answer = " ".join(sentence for sentence in sentences[:2] if sentence).strip()
+    answer = select_relevant_reference_answer(message, context)
     if not answer:
         answer = "I couldn't verify that answer right now. Please try rephrasing the question."
         return translate_answer(answer, language), ["general_reference"]
@@ -1401,7 +1426,21 @@ def answer_message(message, language="English", session_id=None):
         }
 
     if not is_banking_related_question(search_question, session):
-        reply, general_methods = build_general_reference_answer(message, language)
+        ready_models = get_ready_models()
+        if ready_models is not None:
+            try:
+                _, _, tokenizer, llm_model = ready_models
+                reply, general_methods = generate_general_llm_response(
+                    message,
+                    session,
+                    tokenizer,
+                    llm_model,
+                    language,
+                )
+            except Exception:
+                reply, general_methods = build_general_reference_answer(message, language)
+        else:
+            reply, general_methods = build_general_reference_answer(message, language)
         session["chat_history"].append({"role": "bot", "message": reply})
         return {
             "session_id": session_id,
