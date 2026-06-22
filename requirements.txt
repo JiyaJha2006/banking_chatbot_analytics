@@ -1,6 +1,5 @@
 sentence-transformers
 transformers
-torch
 sentencepiece
 numpy
 pandas
