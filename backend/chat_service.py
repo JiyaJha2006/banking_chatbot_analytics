@@ -2,6 +2,7 @@
 
 import uuid
 import re
+from difflib import SequenceMatcher, get_close_matches
 from functools import lru_cache
 from pathlib import Path
 
@@ -16,6 +17,76 @@ DB_PATH = str(DATA_DIR / "vector_db")
 BANKING_COLLECTION_NAME = "banking_knowledge_base"
 MEMORY_COLLECTION_NAME = "chat_memory"
 SESSIONS = {}
+BANKING_METADATA_CACHE = {"count": -1, "metadatas": []}
+
+BANKING_TOPIC_ALIASES = {
+    "savings account": "savings account",
+    "saving account": "savings account",
+    "student account": "student savings account",
+    "salary account": "salary account",
+    "current account": "current account",
+    "zero balance account": "zero balance savings account",
+    "fixed deposit": "fixed deposit",
+    "fd": "fixed deposit",
+    "recurring deposit": "recurring deposit",
+    "rd": "recurring deposit",
+    "home loan": "home loan",
+    "housing loan": "home loan",
+    "personal loan": "personal loan",
+    "education loan": "education loan",
+    "car loan": "car loan",
+    "vehicle loan": "vehicle loan",
+    "gold loan": "gold loan",
+    "credit card": "credit card",
+    "debit card": "debit card",
+    "atm card": "debit card",
+    "net banking": "net banking",
+    "netbanking": "net banking",
+    "internet banking": "net banking",
+    "mobile banking": "mobile banking",
+    "upi": "UPI",
+    "kyc": "KYC",
+    "neft": "NEFT",
+    "rtgs": "RTGS",
+    "imps": "IMPS",
+    "cheque": "cheque",
+    "checkbook": "cheque book",
+    "cheque book": "cheque book",
+    "passbook": "passbook",
+    "bank statement": "bank statement",
+    "minimum balance": "minimum balance",
+}
+
+BANKING_VOCABULARY = set(
+    " ".join(BANKING_TOPIC_ALIASES).split()
+) | {
+    "account", "bank", "banking", "balance", "branch", "cash", "charge",
+    "deposit", "document", "eligibility", "fee", "interest", "loan", "money",
+    "nominee", "password", "payment", "pin", "statement", "transaction",
+    "transfer", "withdrawal", "apply", "open", "activate", "documents",
+    "required", "salaried", "self-employed", "compare", "benefits", "fees",
+    "charges", "steps",
+}
+
+QUERY_WORDS = {
+    "what", "when", "where", "which", "who", "why", "how", "can", "could",
+    "do", "does", "is", "are", "help", "make", "create", "start", "tell",
+    "explain", "need", "needed", "required", "about", "for", "with", "my",
+    "me", "i", "it", "this", "that", "them", "they", "more", "much",
+}
+
+COMMON_QUERY_CORRECTIONS = {
+    "hlp": "help",
+    "pls": "please",
+    "acount": "account",
+    "accnt": "account",
+    "savngs": "savings",
+    "documnts": "documents",
+    "eligiblity": "eligibility",
+    "intrest": "interest",
+    "pasword": "password",
+    "transction": "transaction",
+}
 
 
 @lru_cache(maxsize=1)
@@ -40,7 +111,13 @@ def load_vector_db():
 def get_session(session_id=None):
     if not session_id:
         session_id = str(uuid.uuid4())
-    SESSIONS.setdefault(session_id, {"chat_history": [], "current_topic": ""})
+    SESSIONS.setdefault(session_id, {
+        "chat_history": [],
+        "current_topic": "",
+        "current_intent": "general",
+        "topic_history": [],
+        "last_resolved_question": "",
+    })
     return session_id, SESSIONS[session_id]
 
 
@@ -50,9 +127,15 @@ def is_follow_up_question(user_question):
         "it", "that", "this", "they", "them", "those", "these", "for it",
         "about it", "for that", "about that", "how much", "what documents",
         "documents needed", "required documents", "explain more", "tell me more",
-        "what about", "does it", "can it", "is it",
+        "what about", "does it", "can it", "is it", "which is better",
+        "better one", "how long", "what next", "then what",
     ]
-    return len(q.split()) <= 5 or any(phrase in q for phrase in phrases)
+    if any(re.search(rf"\b{re.escape(phrase)}\b", q) for phrase in phrases):
+        return True
+    intent = detect_question_intent(q)
+    return len(q.split()) <= 7 and intent in {
+        "documents", "fees", "interest", "tenure", "limits", "eligibility", "opening", "process"
+    }
 
 
 def build_recent_chat_history(session):
@@ -81,11 +164,29 @@ def resolve_question_context(user_question, session):
     if explicit_topic or not current_topic or not is_follow_up_question(user_question):
         return user_question
 
-    resolved = f" {user_question.lower().strip()} "
+    resolved = f" {user_question.strip()} "
     for pronoun in ["it", "this", "that", "they", "them", "those", "these"]:
-        resolved = resolved.replace(f" {pronoun} ", f" {current_topic} ")
+        resolved = re.sub(rf"\b{pronoun}\b", current_topic, resolved, flags=re.IGNORECASE)
     resolved = " ".join(resolved.split())
-    return resolved if resolved != user_question.lower().strip() else f"{user_question} about {current_topic}"
+    if current_topic.lower() not in resolved.lower():
+        resolved = f"{resolved} about {current_topic}"
+    return resolved
+
+
+def remember_conversation_context(session, topic="", intent="general", resolved_question=""):
+    topic = normalize_topic_label(topic)
+    if topic and topic.lower() not in {"account recommendation", "banking", "bank"}:
+        previous = session.get("current_topic", "")
+        if previous and previous != topic:
+            history = session.setdefault("topic_history", [])
+            if previous not in history:
+                history.append(previous)
+            session["topic_history"] = history[-4:]
+        session["current_topic"] = topic
+    if intent and intent != "general":
+        session["current_intent"] = intent
+    if resolved_question:
+        session["last_resolved_question"] = resolved_question
 
 
 def detect_question_intent(question):
@@ -93,6 +194,9 @@ def detect_question_intent(question):
     intent_rules = [
         ("documents", ["document", "documents", "proof", "kyc", "required", "requirement", "need to carry", "needed"]),
         ("fees", ["fee", "fees", "charge", "charges", "cost", "minimum balance", "penalty"]),
+        ("interest", ["interest rate", "rate of interest", "returns", "interest earned", "how much interest"]),
+        ("tenure", ["how long", "tenure", "duration", "maturity period", "term period"]),
+        ("limits", ["limit", "limits", "maximum amount", "minimum amount", "transaction limit", "withdrawal limit"]),
         ("eligibility", ["eligible", "eligibility", "who can", "can i", "allowed", "qualify"]),
         ("opening", ["open", "opening", "make", "create", "start", "set up", "setup", "apply", "register", "get an account", "get a card"]),
         ("process", ["how can", "how do", "how to", "steps", "procedure", "process", "way to", "ways to", "help me"]),
@@ -115,6 +219,12 @@ def build_intent_search_query(search_query, intent):
         return f"fees charges minimum balance cost for {search_query}"
     if intent == "eligibility":
         return f"eligibility who can apply allowed for {search_query}"
+    if intent == "interest":
+        return f"interest rate returns earned for {search_query}"
+    if intent == "tenure":
+        return f"tenure duration maturity period for {search_query}"
+    if intent == "limits":
+        return f"minimum maximum transaction withdrawal limits for {search_query}"
     if intent == "definition":
         return f"what is meaning definition explanation {search_query}"
     return search_query
@@ -265,6 +375,11 @@ def should_use_form_assistant(question, topic, intent):
 
 def extract_topic_from_question(user_question):
     text = re.sub(r"[^a-z0-9\s]", " ", user_question.lower())
+    text = " ".join(text.split())
+    for alias in sorted(BANKING_TOPIC_ALIASES, key=len, reverse=True):
+        if re.search(rf"\b{re.escape(alias)}\b", text):
+            return BANKING_TOPIC_ALIASES[alias]
+
     remove_phrases = [
         "what is", "what are", "how can i", "how do i", "how to", "help me",
         "tell me about", "explain", "define", "meaning of", "documents required",
@@ -285,14 +400,92 @@ def extract_topic_from_question(user_question):
     domain_nouns = {
         "account", "card", "loan", "deposit", "facility", "service", "cheque",
         "payment", "banking", "insurance", "investment", "fund", "statement",
-        "password", "pin", "branch", "netbanking", "transaction",
+        "password", "pin", "branch", "netbanking", "transaction", "mortgage",
     }
     candidates = []
     for index, word in enumerate(words):
         if word in domain_nouns:
             start = max(0, index - 3)
             candidates.append(" ".join(words[start:index + 1]))
-    return max(candidates, key=len) if candidates else " ".join(words[:5])
+    return max(candidates, key=len) if candidates else ""
+
+
+def normalize_banking_spelling(question):
+    tokens = re.findall(r"[a-z0-9']+|[^a-z0-9']+", question.lower())
+    corrected = []
+    vocabulary = BANKING_VOCABULARY | QUERY_WORDS
+    for token in tokens:
+        if token in COMMON_QUERY_CORRECTIONS:
+            corrected.append(COMMON_QUERY_CORRECTIONS[token])
+            continue
+        if not token.isalpha() or len(token) < 4 or token in vocabulary:
+            corrected.append(token)
+            continue
+        match = get_close_matches(token, vocabulary, n=1, cutoff=0.78)
+        corrected.append(match[0] if match else token)
+    return "".join(corrected).strip()
+
+
+def question_clarity_score(question, session):
+    words = re.findall(r"[a-z0-9]+", question.lower())
+    if not words:
+        return 0.0
+    recognized = sum(word in BANKING_VOCABULARY or word in QUERY_WORDS for word in words)
+    score = recognized / len(words)
+    if extract_topic_from_question(question):
+        score += 0.45
+    if session.get("current_topic") and is_follow_up_question(question):
+        score += 0.35
+    if detect_question_intent(question) != "general":
+        score += 0.2
+    return score
+
+
+def question_needs_llm_rewrite(question, session):
+    words = re.findall(r"[a-z0-9]+", question.lower())
+    if len(words) <= 1 and not extract_topic_from_question(question):
+        return True
+    return question_clarity_score(question, session) < 0.42
+
+
+def rewrite_unclear_question(question, session, tokenizer, llm_model):
+    current_topic = session.get("current_topic", "") or "none"
+    history = build_recent_chat_history(session)
+    prompt = f"""
+You clean up banking questions.
+Rewrite the user's message as one clear English banking question.
+Use the current topic only when the message is a follow-up.
+Do not answer the question.
+If the message cannot reasonably be understood as a banking question, output exactly: CLARIFY
+
+Current topic: {current_topic}
+Recent conversation:
+{history}
+User message: {question}
+
+Rewritten question:
+"""
+    inputs = tokenizer(prompt, return_tensors="pt", max_length=512, truncation=True)
+    outputs = llm_model.generate(**inputs, max_new_tokens=48, num_beams=3, do_sample=False)
+    rewritten = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+    rewritten = re.sub(r"^(rewritten question|question)\s*:\s*", "", rewritten, flags=re.IGNORECASE).strip()
+    if not rewritten or "clarify" in rewritten.lower():
+        return ""
+    if len(re.findall(r"[a-z0-9]+", rewritten.lower())) < 3:
+        return ""
+    original_terms = search_tokens(question)
+    rewritten_terms = search_tokens(rewritten)
+    meaningful_overlap = original_terms & rewritten_terms
+    if not session.get("current_topic") and not meaningful_overlap and question_clarity_score(question, session) < 0.15:
+        return ""
+    return rewritten
+
+
+def build_clarification_reply(session):
+    topic = session.get("current_topic", "")
+    if topic:
+        return f"I could not clearly understand that. Are you asking about the documents, eligibility, fees, or application steps for {topic}?"
+    return "I could not clearly understand that banking question. Please mention the product or service, for example savings account, home loan, FD, card, UPI, or net banking."
 
 
 def retrieve_banking_context(search_query, embedding_model, banking_collection, top_k=40):
@@ -312,6 +505,126 @@ Answer: {metadata.get('answer', '')}
 Distance: {distances[i] if i < len(distances) else ''}
 """
     return context, metadatas, distances
+
+
+def search_tokens(text):
+    stopwords = {
+        "a", "an", "the", "is", "are", "was", "were", "be", "to", "of", "for",
+        "and", "or", "in", "on", "at", "with", "my", "me", "i", "you", "your",
+        "please", "tell", "about", "can", "could", "would", "do", "does",
+    }
+    return {
+        token for token in re.findall(r"[a-z0-9]+", text.lower())
+        if len(token) > 1 and token not in stopwords
+    }
+
+
+def candidate_key(metadata):
+    return f"{metadata.get('question', '').strip().lower()}|{metadata.get('answer', '').strip().lower()}"
+
+
+def get_cached_banking_metadatas(banking_collection):
+    count = banking_collection.count()
+    if BANKING_METADATA_CACHE["count"] != count:
+        results = banking_collection.get(include=["metadatas"])
+        BANKING_METADATA_CACHE["count"] = count
+        BANKING_METADATA_CACHE["metadatas"] = [
+            metadata for metadata in results.get("metadatas", []) if metadata
+        ]
+    return BANKING_METADATA_CACHE["metadatas"]
+
+
+def lexical_candidate_score(query, metadata, topic="", intent="general"):
+    question = str(metadata.get("question", ""))
+    answer = str(metadata.get("answer", ""))
+    section = str(metadata.get("section", ""))
+    candidate_text = f"{question} {answer} {section}".lower()
+    query_text = query.lower().strip()
+    query_terms = search_tokens(query_text)
+    candidate_terms = search_tokens(candidate_text)
+    if not query_terms:
+        return 0.0
+    overlap = len(query_terms & candidate_terms) / len(query_terms)
+    question_ratio = SequenceMatcher(None, query_text, question.lower()).ratio()
+    phrase_bonus = 5.0 if query_text and query_text in candidate_text else 0.0
+    topic_bonus = score_topic_match(topic, candidate_text)
+    intent_bonus = score_intent_match(intent, candidate_text)
+    return overlap * 7.0 + question_ratio * 3.0 + phrase_bonus + topic_bonus + intent_bonus
+
+
+def retrieve_hybrid_banking_context(
+    raw_query,
+    expanded_query,
+    topic,
+    intent,
+    embedding_model,
+    banking_collection,
+    top_k=40,
+):
+    fused = {}
+    query_variants = []
+    for query in [raw_query, expanded_query, f"{topic} {intent}".strip()]:
+        query = " ".join(str(query or "").split())
+        if query and query.lower() not in {item.lower() for item in query_variants}:
+            query_variants.append(query)
+
+    collection_count = banking_collection.count()
+    vector_limit = min(20, collection_count) if collection_count else 0
+    for variant_index, query in enumerate(query_variants):
+        if not vector_limit:
+            break
+        query_embedding = embedding_model.encode(query).tolist()
+        results = banking_collection.query(query_embeddings=[query_embedding], n_results=vector_limit)
+        metadatas = results.get("metadatas", [[]])[0]
+        distances = results.get("distances", [[]])[0]
+        for rank, metadata in enumerate(metadatas):
+            key = candidate_key(metadata)
+            item = fused.setdefault(key, {"metadata": metadata, "score": 0.0, "distance": None, "methods": set()})
+            item["score"] += (4.0 - min(variant_index, 2) * 0.6) / (rank + 1)
+            if rank < len(distances):
+                distance = float(distances[rank])
+                item["distance"] = distance if item["distance"] is None else min(item["distance"], distance)
+                item["score"] += max(0.0, 1.5 - distance)
+            item["methods"].add("vector")
+
+    lexical_ranked = []
+    for metadata in get_cached_banking_metadatas(banking_collection):
+        score = max(
+            lexical_candidate_score(query, metadata, topic, intent)
+            for query in query_variants
+        )
+        if score > 0:
+            lexical_ranked.append((score, metadata))
+    lexical_ranked.sort(key=lambda item: item[0], reverse=True)
+    for rank, (score, metadata) in enumerate(lexical_ranked[:30]):
+        key = candidate_key(metadata)
+        item = fused.setdefault(key, {"metadata": metadata, "score": 0.0, "distance": None, "methods": set()})
+        item["score"] += score + 3.0 / (rank + 1)
+        item["methods"].add("lexical")
+        question = str(metadata.get("question", "")).lower()
+        if any(query.lower() in question for query in query_variants if len(query) > 4):
+            item["methods"].add("exact")
+        elif any(SequenceMatcher(None, query.lower(), question).ratio() >= 0.72 for query in query_variants):
+            item["methods"].add("fuzzy")
+
+    ranked = sorted(fused.values(), key=lambda item: item["score"], reverse=True)[:top_k]
+    context_parts = []
+    sources = []
+    scores = []
+    for index, item in enumerate(ranked, 1):
+        metadata = item["metadata"]
+        source = {**metadata, "search_methods": sorted(item["methods"]), "hybrid_score": round(item["score"], 4)}
+        sources.append(source)
+        scores.append(item["score"])
+        context_parts.append(
+            f"Result {index}:\n"
+            f"Section: {metadata.get('section', '')}\n"
+            f"Question: {metadata.get('question', '')}\n"
+            f"Answer: {metadata.get('answer', '')}\n"
+            f"Search methods: {', '.join(sorted(item['methods']))}\n"
+            f"Hybrid score: {item['score']:.4f}\n"
+        )
+    return "\n".join(context_parts), sources, scores
 
 
 def retrieve_chat_memory(search_query, embedding_model, memory_collection, top_k=1):
@@ -340,6 +653,9 @@ def score_intent_match(intent, candidate_text):
         "documents": ["documents", "proof", "kyc", "identity proof", "address proof", "photograph", "required", "carry"],
         "process": ["steps", "process", "procedure", "follow", "submit", "visit", "log in", "click", "fill"],
         "fees": ["fee", "fees", "charge", "charges", "cost", "minimum balance", "penalty"],
+        "interest": ["interest", "interest rate", "rate of interest", "returns", "earned"],
+        "tenure": ["tenure", "duration", "maturity", "period", "months", "years"],
+        "limits": ["limit", "maximum", "minimum", "per day", "daily", "amount"],
         "eligibility": ["eligible", "eligibility", "who can", "can open", "allowed", "resident", "individual"],
         "definition": ["is a", "means", "refers to", "defined", "product where"],
     }
@@ -699,6 +1015,17 @@ You are a banking assistant.
 {instruction}
 
 Rewrite the retrieved answer into a short, clear answer for the user.
+Keep the user's requested intent: {intent}.
+Keep the banking topic: {topic or 'unknown'}.
+Use recent conversation only to resolve follow-up references.
+Do not replace a requested process, document list, fee, or eligibility answer with a definition.
+Do not add facts that are not supported by the retrieved answer.
+
+Recent Conversation:
+{recent_chat_history}
+
+Relevant Past Memory:
+{memory_context}
 
 User Question:
 {rerank_query or user_question}
@@ -708,7 +1035,7 @@ Retrieved Answer:
 
 Final Answer:
 """
-    inputs = tokenizer(prompt, return_tensors="pt", max_length=512, truncation=True)
+    inputs = tokenizer(prompt, return_tensors="pt", max_length=768, truncation=True)
     outputs = llm_model.generate(**inputs, max_new_tokens=80, num_beams=1, do_sample=False)
     answer = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
     if len(answer.split()) < 5 or "?" in answer or answer.lower() == user_question.lower() or is_generic_help_answer(answer):
@@ -724,11 +1051,15 @@ def answer_message(message, language="English", session_id=None):
         language = "English"
 
     session_id, session = get_session(session_id)
-    search_question = translate_question_for_search(message, language)
+    translated_question = translate_question_for_search(message, language)
+    search_question = normalize_banking_spelling(translated_question)
     resolved_question = resolve_question_context(search_question, session)
     intent = detect_question_intent(resolved_question)
-    topic = extract_topic_from_question(resolved_question) if is_follow_up_question(search_question) else extract_topic_from_question(search_question)
-    topic = topic or extract_topic_from_question(resolved_question)
+    if intent == "general" and is_follow_up_question(search_question):
+        intent = session.get("current_intent", "general")
+    topic = extract_topic_from_question(resolved_question)
+    if not topic and is_follow_up_question(search_question):
+        topic = session.get("current_topic", "")
     session["chat_history"].append({"role": "user", "message": message})
     pending_flow_topic = (session.get("pending_flow") or {}).get("topic", "")
     suggested_questions = translate_suggested_questions(build_suggested_questions(topic, intent), language)
@@ -736,7 +1067,7 @@ def answer_message(message, language="English", session_id=None):
     comparison = compare_products(search_question)
     if comparison:
         reply = translate_answer(comparison["reply"], language)
-        session["current_topic"] = comparison["topic"]
+        remember_conversation_context(session, comparison["topic"], "comparison", comparison["topic"])
         session["chat_history"].append({"role": "bot", "message": reply})
         return {
             "session_id": session_id,
@@ -757,8 +1088,7 @@ def answer_message(message, language="English", session_id=None):
         response_topic = pending_flow_topic or topic
         response_suggestions = translate_suggested_questions(build_suggested_questions(response_topic, intent), language)
         reply = translate_answer(pending_reply, language)
-        if response_topic:
-            session["current_topic"] = response_topic
+        remember_conversation_context(session, response_topic, intent, resolved_question)
         session["chat_history"].append({"role": "bot", "message": reply})
         return {
             "session_id": session_id,
@@ -772,8 +1102,7 @@ def answer_message(message, language="English", session_id=None):
     clarifying_reply = build_clarifying_question(search_question, topic, intent, session)
     if clarifying_reply:
         reply = translate_answer(clarifying_reply, language)
-        if topic:
-            session["current_topic"] = topic
+        remember_conversation_context(session, topic, intent, resolved_question)
         session["chat_history"].append({"role": "bot", "message": reply})
         return {
             "session_id": session_id,
@@ -787,8 +1116,7 @@ def answer_message(message, language="English", session_id=None):
     if should_use_form_assistant(resolved_question, topic, intent):
         reply = build_form_assistant_answer(topic, intent, search_question)
         reply = translate_answer(reply, language)
-        if topic:
-            session["current_topic"] = topic
+        remember_conversation_context(session, topic, intent, resolved_question)
         session["chat_history"].append({"role": "bot", "message": reply})
         return {
             "session_id": session_id,
@@ -802,7 +1130,8 @@ def answer_message(message, language="English", session_id=None):
     if is_account_recommendation_question(search_question):
         reply, recommendation_card = recommend_account(search_question)
         reply = translate_answer(reply, language)
-        session["current_topic"] = "account recommendation"
+        recommendation_topic = recommendation_card.get("account", "account recommendation")
+        remember_conversation_context(session, recommendation_topic, "recommendation", search_question)
         session["chat_history"].append({"role": "bot", "message": reply})
         return {
             "session_id": session_id,
@@ -815,25 +1144,52 @@ def answer_message(message, language="English", session_id=None):
                 "What benefits does the recommended account offer?",
             ], language),
             "recommendation_card": recommendation_card,
-            "topic": "account recommendation",
+            "topic": recommendation_topic,
         }
 
     embedding_model, reranker_model, tokenizer, llm_model = load_models()
     banking_collection, memory_collection = load_vector_db()
+
+    rewritten_question = ""
+    if question_needs_llm_rewrite(resolved_question, session):
+        rewritten_question = rewrite_unclear_question(resolved_question, session, tokenizer, llm_model)
+        if not rewritten_question:
+            reply = translate_answer(build_clarification_reply(session), language)
+            session["chat_history"].append({"role": "bot", "message": reply})
+            return {
+                "session_id": session_id,
+                "reply": reply,
+                "history": session["chat_history"],
+                "sources": [],
+                "suggested_questions": translate_suggested_questions(build_suggested_questions(session.get("current_topic", "")), language),
+                "topic": session.get("current_topic", ""),
+                "needs_clarification": True,
+            }
+        resolved_question = resolve_question_context(rewritten_question, session)
+        intent = detect_question_intent(resolved_question)
+        if intent == "general" and is_follow_up_question(rewritten_question):
+            intent = session.get("current_intent", "general")
+        topic = extract_topic_from_question(resolved_question) or session.get("current_topic", "")
+        suggested_questions = translate_suggested_questions(build_suggested_questions(topic, intent), language)
+
     search_query = build_intent_search_query(resolved_question, intent)
 
     recommendation_card = None
-    banking_context, sources, _ = retrieve_banking_context(search_query, embedding_model, banking_collection)
+    banking_context, sources, _ = retrieve_hybrid_banking_context(
+        resolved_question,
+        search_query,
+        topic,
+        intent,
+        embedding_model,
+        banking_collection,
+    )
     memory_context = retrieve_chat_memory(search_query, embedding_model, memory_collection)
     recent_history = build_recent_chat_history(session)
     reply = generate_llm_answer(message, banking_context, memory_context, recent_history, reranker_model, tokenizer, llm_model, language, intent, search_query, topic)
     reply = translate_answer(reply, language)
 
     save_chat_memory(message, reply, embedding_model, memory_collection)
-    if topic:
-        session["current_topic"] = topic
-    if not session.get("current_topic"):
-        session["current_topic"] = extract_topic_from_question(resolved_question)
+    remember_conversation_context(session, topic, intent, resolved_question)
     session["chat_history"].append({"role": "bot", "message": reply})
 
     return {
@@ -844,4 +1200,6 @@ def answer_message(message, language="English", session_id=None):
         "suggested_questions": suggested_questions,
         "recommendation_card": recommendation_card,
         "topic": topic,
+        "rewritten_question": rewritten_question or None,
+        "search_methods": ["vector", "lexical", "exact", "fuzzy", "cross_encoder"],
     }
