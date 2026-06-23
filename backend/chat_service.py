@@ -92,6 +92,53 @@ COMMON_QUERY_CORRECTIONS = {
     "transction": "transaction",
 }
 
+SENSITIVE_PERSONAL_TERMS = [
+    "password", "passcode", "pin", "otp", "one time password", "cvv", "card number",
+    "debit card number", "credit card number", "account number", "ifsc", "routing number",
+    "sort code", "aadhaar", "aadhar", "pan number", "passport number", "social security",
+    "ssn", "date of birth", "dob", "address", "phone number", "mobile number", "email",
+    "login id", "user id", "username", "security answer", "secret answer", "mother's maiden",
+    "balance", "transaction history", "bank statement",
+]
+
+SENSITIVE_REQUEST_PATTERNS = [
+    r"\b(what|tell|show|give|send|share|find|check|display|reveal)\b.*\b(my|me|mine|this user|that user|someone|customer|account holder)\b",
+    r"\b(my|mine|me|this user|that user|someone|customer|account holder)\b.*\b(what|tell|show|give|send|share|find|check|display|reveal)\b",
+    r"\b(can|could|will|would)\s+you\b.*\b(access|open|see|view|retrieve|fetch)\b.*\b(my|someone|customer)\b",
+]
+
+SENSITIVE_ACTION_EXCEPTIONS = [
+    "reset", "change", "update", "recover", "forgot", "protect", "secure", "block",
+    "unblock", "report", "lost", "stolen", "apply", "register", "create", "set up",
+    "activate", "deactivate", "close", "download", "generate statement",
+]
+
+
+def is_sensitive_personal_question(question):
+    q = question.lower().strip()
+    if not q:
+        return False
+    if any(exception in q for exception in SENSITIVE_ACTION_EXCEPTIONS):
+        return False
+    has_sensitive_term = any(re.search(rf"\b{re.escape(term)}\b", q) for term in SENSITIVE_PERSONAL_TERMS)
+    if not has_sensitive_term:
+        return False
+    return any(re.search(pattern, q) for pattern in SENSITIVE_REQUEST_PATTERNS)
+
+
+def build_sensitive_personal_refusal(language="English"):
+    if language == "Hindi":
+        return (
+            "Maaf kijiye, main passwords, OTP, PIN, card/account numbers, balance, "
+            "transaction history ya kisi bhi private personal detail ko bata ya verify nahi kar sakta. "
+            "Aisi information ke liye apne bank ki official app, website, ya branch ka use karein."
+        )
+    return (
+        "I cannot answer questions that ask for private personal information such as passwords, OTPs, PINs, "
+        "card or account numbers, balances, transaction history, addresses, or identity details. "
+        "Please use your bank's official app, website, or branch for private account information."
+    )
+
 
 @lru_cache(maxsize=1)
 def load_models():
@@ -1338,6 +1385,25 @@ def answer_message(message, language="English", session_id=None):
         language = "English"
 
     session_id, session = get_session(session_id)
+    if is_sensitive_personal_question(message):
+        reply = build_sensitive_personal_refusal(language)
+        session["chat_history"].append({"role": "user", "message": message})
+        session["chat_history"].append({"role": "bot", "message": reply})
+        return {
+            "session_id": session_id,
+            "reply": reply,
+            "history": session["chat_history"],
+            "sources": [],
+            "suggested_questions": translate_suggested_questions([
+                "How do I reset my banking password?",
+                "How do I report a lost card?",
+                "How do I protect my bank account?",
+            ], language),
+            "topic": "privacy restriction",
+            "restricted": True,
+            "search_methods": ["privacy_guard"],
+        }
+
     translated_question = translate_question_for_search(message, language)
     search_question = normalize_banking_spelling(translated_question)
     resolved_question = resolve_question_context(search_question, session)
