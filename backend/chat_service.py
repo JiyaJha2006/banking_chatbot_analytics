@@ -486,6 +486,13 @@ def should_use_form_assistant(question, topic, intent):
     if not category:
         return False
     q = str(question or "").lower()
+    security_words = [
+        "block", "blocked", "lost", "stolen", "fraud", "fraudulent", "unauthorized",
+        "unauthorised", "dispute", "chargeback", "phishing", "vishing", "skimming",
+        "suspicious", "security", "replace card", "replacement card",
+    ]
+    if any(word in q for word in security_words):
+        return False
     action_words = ["apply", "open", "make", "create", "start", "documents", "required", "needed", "how do", "how can", "steps", "process"]
     return intent in {"opening", "documents", "process"} or any(word in q for word in action_words)
 
