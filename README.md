@@ -59,15 +59,16 @@ banking_chatbot_analytics/
     chat_service.py              Chatbot logic, RAG, recommendations, comparisons
     db.py                        Environment-based MySQL configuration
     ingest.py                    Builds Chroma vector database
-    load_mysql_data.py           Loads FAQ CSV data into MySQL
-    sync_embeddings.py           Syncs MySQL FAQ data into Chroma
+    load_mysql_data.py           Loads official markdown KB data into MySQL
+    official_kb.py               Parses official markdown knowledge-base files
+    sync_embeddings.py           Syncs MySQL knowledge data into Chroma
   frontend/
     src/main.jsx                 React application
     src/styles.css               UI styling
     package.json                 Frontend dependencies and scripts
   data/
-    BankFAQs.csv                 Banking FAQ dataset
-    vector_db/                   ChromaDB vector database
+    official_kb/                 Official markdown knowledge-base files
+    vector_db/                   Generated ChromaDB vector database
   .github/workflows/
     ci.yml                       GitHub Actions CI workflow
 ```
@@ -98,7 +99,7 @@ AI and Search:
 - Hugging Face Transformers
 - FLAN-T5
 - ChromaDB vector database
-- Banking FAQ dataset
+- Official markdown banking knowledge base
 
 Deployment and DevOps:
 
@@ -115,7 +116,7 @@ Deployment and DevOps:
 4. The user asks a banking question.
 5. The backend detects intent and context.
 6. The chatbot either:
-   - answers from the banking FAQ knowledge base,
+   - answers from the official banking knowledge base,
    - asks a follow-up question,
    - recommends an account,
    - compares banking products,
@@ -378,7 +379,7 @@ SQLite stores:
 
 ## Rebuild Vector Database
 
-If the FAQ dataset changes, rebuild ChromaDB:
+If the official markdown knowledge base changes, rebuild ChromaDB:
 
 ```powershell
 python backend/ingest.py
@@ -392,7 +393,7 @@ Test MySQL connection:
 python backend/mysql_test.py
 ```
 
-Load FAQ data into MySQL:
+Load official knowledge-base data into MySQL:
 
 ```powershell
 python backend/load_mysql_data.py

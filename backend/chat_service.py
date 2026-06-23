@@ -14,6 +14,8 @@ from deep_translator import GoogleTranslator
 from sentence_transformers import CrossEncoder, SentenceTransformer
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
+from .official_kb import load_official_kb_documents
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data"
 DB_PATH = str(DATA_DIR / "vector_db")
@@ -159,10 +161,64 @@ def get_ready_models():
 @lru_cache(maxsize=1)
 def load_vector_db():
     client = chromadb.PersistentClient(path=DB_PATH)
+    banking_collection = client.get_or_create_collection(name=BANKING_COLLECTION_NAME)
+    banking_collection = ensure_official_banking_collection(client, banking_collection)
     return (
-        client.get_or_create_collection(name=BANKING_COLLECTION_NAME),
+        banking_collection,
         client.get_or_create_collection(name=MEMORY_COLLECTION_NAME),
     )
+
+
+def collection_uses_official_kb(collection, expected_count):
+    if collection.count() != expected_count:
+        return False
+    if expected_count == 0:
+        return False
+    sample = collection.get(limit=1, include=["metadatas"])
+    metadatas = sample.get("metadatas") or []
+    return bool(metadatas and metadatas[0].get("dataset") == "official_kb")
+
+
+def ensure_official_banking_collection(client, collection):
+    official_documents = load_official_kb_documents()
+    if not official_documents:
+        return collection
+    if collection_uses_official_kb(collection, len(official_documents)):
+        return collection
+
+    client.delete_collection(name=BANKING_COLLECTION_NAME)
+    collection = client.get_or_create_collection(name=BANKING_COLLECTION_NAME)
+    ready_models = get_ready_models()
+    embedding_model = ready_models[0] if ready_models is not None else SentenceTransformer("all-MiniLM-L6-v2")
+
+    ids = []
+    documents = []
+    embeddings = []
+    metadatas = []
+    for item in official_documents:
+        document_text = (
+            f"Section: {item['section']}\n"
+            f"Question: {item['question']}\n"
+            f"Answer: {item['answer']}\n"
+            f"Source: {item['source']}"
+        )
+        ids.append(item["id"])
+        documents.append(document_text)
+        embeddings.append(embedding_model.encode(document_text).tolist())
+        metadatas.append(
+            {
+                "section": item["section"],
+                "question": item["question"],
+                "answer": item["answer"],
+                "source": item["source"],
+                "source_file": item["source_file"],
+                "dataset": "official_kb",
+            }
+        )
+    collection.upsert(ids=ids, documents=documents, embeddings=embeddings, metadatas=metadatas)
+    BANKING_METADATA_CACHE["count"] = -1
+    BANKING_METADATA_CACHE["metadatas"] = []
+    return collection
 
 
 def get_session(session_id=None):
