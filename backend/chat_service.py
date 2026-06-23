@@ -430,6 +430,48 @@ def should_use_form_assistant(question, topic, intent):
     return intent in {"opening", "documents", "process"} or any(word in q for word in action_words)
 
 
+def is_credential_help_question(question):
+    q = str(question or "").lower()
+    credential_terms = ["password", "passcode", "pin", "mpin", "login id", "user id", "username"]
+    help_terms = [
+        "reset", "change", "update", "recover", "forgot", "forget", "blocked",
+        "unblock", "protect", "secure", "safe", "not working", "locked",
+    ]
+    return any(term in q for term in credential_terms) and any(term in q for term in help_terms)
+
+
+def build_credential_help_answer(question, language="English"):
+    q = str(question or "").lower()
+    credential = "PIN" if "pin" in q or "mpin" in q else "banking password"
+    if language == "Hindi":
+        return (
+            f"Apna {credential} reset ya change karne ke liye:\n"
+            "1. Bank ki official app ya website kholiye.\n"
+            "2. Login page par Forgot Password / Reset Password option select kijiye.\n"
+            "3. Apna customer ID, registered mobile number, ya username enter kijiye.\n"
+            "4. OTP sirf official bank screen par enter kijiye. Kisi ko OTP, PIN, ya password mat batayein.\n"
+            "5. Naya strong password set kijiye aur confirmation message check kijiye.\n\n"
+            "Agar account locked hai ya OTP nahi aa raha, bank customer care ya branch se contact kijiye."
+        )
+    return (
+        f"To reset or change your {credential}:\n"
+        "1. Open your bank's official app or website.\n"
+        "2. Choose Forgot Password / Reset Password on the login page.\n"
+        "3. Enter your customer ID, registered mobile number, or username.\n"
+        "4. Verify using OTP only on the official bank screen. Do not share your OTP, PIN, or password with anyone.\n"
+        "5. Set a new strong password and confirm the update.\n\n"
+        "If your account is locked or OTP is not arriving, contact the bank's customer care or visit a branch."
+    )
+
+
+def build_credential_help_suggestions(language="English"):
+    return translate_suggested_questions([
+        "How do I protect my bank account?",
+        "How do I report a lost card?",
+        "How do I unblock net banking?",
+    ], language)
+
+
 def extract_topic_from_question(user_question):
     text = re.sub(r"[^a-z0-9\s]", " ", user_question.lower())
     text = " ".join(text.split())
@@ -1414,6 +1456,20 @@ def answer_message(message, language="English", session_id=None):
     if not topic and is_follow_up_question(search_question):
         topic = session.get("current_topic", "")
     session["chat_history"].append({"role": "user", "message": message})
+    if is_credential_help_question(search_question):
+        reply = build_credential_help_answer(search_question, language)
+        remember_conversation_context(session, "banking password" if "password" in search_question else "banking PIN", "process", resolved_question)
+        session["chat_history"].append({"role": "bot", "message": reply})
+        return {
+            "session_id": session_id,
+            "reply": reply,
+            "history": session["chat_history"],
+            "sources": [],
+            "suggested_questions": build_credential_help_suggestions(language),
+            "topic": "banking password" if "password" in search_question else "banking PIN",
+            "search_methods": ["credential_help"],
+        }
+
     pending_flow_topic = (session.get("pending_flow") or {}).get("topic", "")
     suggested_questions = translate_suggested_questions(build_suggested_questions(topic, intent), language)
 
