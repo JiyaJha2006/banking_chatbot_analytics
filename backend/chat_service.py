@@ -44,6 +44,8 @@ BANKING_TOPIC_ALIASES = {
     "vehicle loan": "vehicle loan",
     "gold loan": "gold loan",
     "credit card": "credit card",
+    "axis credit card": "credit card",
+    "axis bank credit card": "credit card",
     "debit card": "debit card",
     "atm card": "debit card",
     "net banking": "net banking",
@@ -877,6 +879,13 @@ def get_cached_banking_metadatas(banking_collection):
     return BANKING_METADATA_CACHE["metadatas"]
 
 
+def collection_has_official_kb(banking_collection):
+    return any(
+        metadata.get("dataset") == "official_kb"
+        for metadata in get_cached_banking_metadatas(banking_collection)
+    )
+
+
 def lexical_candidate_score(query, metadata, topic="", intent="general"):
     question = str(metadata.get("question", ""))
     answer = str(metadata.get("answer", ""))
@@ -951,7 +960,7 @@ def retrieve_hybrid_banking_context(
             item["methods"].add("fuzzy")
 
     structured = build_structured_product_candidate(topic, intent)
-    if structured:
+    if structured and not collection_has_official_kb(banking_collection):
         key = candidate_key(structured)
         fused[key] = {
             "metadata": structured,
@@ -982,7 +991,7 @@ def retrieve_hybrid_banking_context(
 
 def retrieve_lightweight_banking_answer(query, topic, intent, banking_collection):
     structured = build_structured_product_candidate(topic, intent)
-    if structured:
+    if structured and not collection_has_official_kb(banking_collection):
         return structured["answer"], [{
             **structured,
             "search_methods": ["structured"],
