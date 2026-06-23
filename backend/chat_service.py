@@ -868,6 +868,10 @@ def candidate_key(metadata):
     return f"{metadata.get('question', '').strip().lower()}|{metadata.get('answer', '').strip().lower()}"
 
 
+def normalize_match_text(text):
+    return " ".join(re.findall(r"[a-z0-9]+", str(text or "").lower()))
+
+
 def get_cached_banking_metadatas(banking_collection):
     count = banking_collection.count()
     if BANKING_METADATA_CACHE["count"] != count:
@@ -899,9 +903,10 @@ def lexical_candidate_score(query, metadata, topic="", intent="general"):
     overlap = len(query_terms & candidate_terms) / len(query_terms)
     question_ratio = SequenceMatcher(None, query_text, question.lower()).ratio()
     phrase_bonus = 5.0 if query_text and query_text in candidate_text else 0.0
+    exact_bonus = 100.0 if normalize_match_text(query_text) == normalize_match_text(question) else 0.0
     topic_bonus = score_topic_match(topic, candidate_text)
     intent_bonus = score_intent_match(intent, candidate_text)
-    return overlap * 7.0 + question_ratio * 3.0 + phrase_bonus + topic_bonus + intent_bonus
+    return exact_bonus + overlap * 7.0 + question_ratio * 3.0 + phrase_bonus + topic_bonus + intent_bonus
 
 
 def retrieve_hybrid_banking_context(
@@ -954,8 +959,11 @@ def retrieve_hybrid_banking_context(
         item["score"] += score + 3.0 / (rank + 1)
         item["methods"].add("lexical")
         question = str(metadata.get("question", "")).lower()
-        if any(query.lower() in question for query in query_variants if len(query) > 4):
+        if any(normalize_match_text(query) == normalize_match_text(question) for query in query_variants):
             item["methods"].add("exact")
+            item["score"] += 50.0
+        elif any(query.lower() in question for query in query_variants if len(query) > 4):
+            item["methods"].add("phrase")
         elif any(SequenceMatcher(None, query.lower(), question).ratio() >= 0.72 for query in query_variants):
             item["methods"].add("fuzzy")
 
@@ -1017,8 +1025,10 @@ def retrieve_lightweight_banking_answer(query, topic, intent, banking_collection
     score, metadata = ranked[0]
     stored_question = str(metadata.get("question", "")).lower()
     methods = ["lexical"]
-    if query.lower().strip() in stored_question:
+    if normalize_match_text(query) == normalize_match_text(stored_question):
         methods.append("exact")
+    elif query.lower().strip() in stored_question:
+        methods.append("phrase")
     elif SequenceMatcher(None, query.lower().strip(), stored_question).ratio() >= 0.72:
         methods.append("fuzzy")
     source = {
@@ -1127,22 +1137,24 @@ def choose_best_answer(user_question, banking_context, reranker_model, intent="g
     for result in banking_context.split("Result "):
         if "Answer:" not in result:
             continue
-        section = ""
-        question = ""
-        answer = ""
-        for line in result.splitlines():
-            line = line.strip()
-            if line.startswith("Section:"):
-                section = line.replace("Section:", "").strip()
-            elif line.startswith("Question:"):
-                question = line.replace("Question:", "").strip()
-            elif line.startswith("Answer:"):
-                answer = line.replace("Answer:", "").strip()
+        section_match = re.search(r"(?m)^Section:\s*(.*?)\s*$", result)
+        question_match = re.search(r"(?m)^Question:\s*(.*?)\s*$", result)
+        answer_match = re.search(r"(?s)Answer:\s*(.*?)(?:\nSearch methods:|\nHybrid score:|\Z)", result)
+        section = section_match.group(1).strip() if section_match else ""
+        question = question_match.group(1).strip() if question_match else ""
+        answer = answer_match.group(1).strip() if answer_match else ""
         if answer:
             text = f"{question} {answer}"
             candidates.append({"section": section, "question": question, "answer": answer, "text": text})
     if not candidates:
         return "I found relevant banking information, but could not extract a clear answer."
+
+    exact_candidates = [
+        candidate for candidate in candidates
+        if normalize_match_text(candidate["question"]) == normalize_match_text(rerank_query or user_question)
+    ]
+    if exact_candidates:
+        return exact_candidates[0]["answer"]
 
     topic_candidates = [candidate for candidate in candidates if candidate_matches_topic(topic, candidate["text"])]
     if topic_candidates:
@@ -1711,11 +1723,23 @@ def answer_message(message, language="English", session_id=None):
         embedding_model,
         banking_collection,
     )
+    exact_official_source = next(
+        (
+            source for source in sources
+            if source.get("dataset") == "official_kb"
+            and "exact" in source.get("search_methods", [])
+            and normalize_match_text(source.get("question", "")) == normalize_match_text(resolved_question)
+        ),
+        None,
+    )
     # Chroma chat memory is shared across users, so it must not influence answers.
     # Session-scoped recent history provides context without cross-account leakage.
     memory_context = ""
     recent_history = build_recent_chat_history(session)
-    reply = generate_llm_answer(message, banking_context, memory_context, recent_history, reranker_model, tokenizer, llm_model, language, intent, search_query, topic)
+    if exact_official_source:
+        reply = str(exact_official_source.get("answer", "")).strip()
+    else:
+        reply = generate_llm_answer(message, banking_context, memory_context, recent_history, reranker_model, tokenizer, llm_model, language, intent, search_query, topic)
     reply = translate_answer(reply, language)
 
     remember_conversation_context(session, topic, intent, resolved_question)
