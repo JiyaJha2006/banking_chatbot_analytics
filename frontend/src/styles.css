@@ -391,6 +391,56 @@ button, input { font: inherit; }
 .bubble { max-width: 74%; padding: 10px 14px; border: 1px solid #cdd8e8; border-radius: 14px 14px 14px 4px; background: #ffffff; color: #24324f; font-size: 14px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
 .message-row.user .bubble { grid-column: 1; border-color: #90a2cc; border-radius: 14px 14px 4px 14px; background: #90a2cc; color: #ffffff; }
 .bubble p { margin: 0; }
+.message-content {
+  display: grid;
+  gap: 9px;
+}
+.message-content p,
+.message-content ul,
+.message-content ol {
+  margin: 0;
+}
+.message-content ul,
+.message-content ol {
+  padding-left: 20px;
+}
+.message-content li {
+  margin: 3px 0;
+}
+.message-content strong {
+  color: #26385f;
+  font-weight: 900;
+}
+.markdown-table-wrap {
+  width: 100%;
+  overflow-x: auto;
+}
+.markdown-table {
+  width: 100%;
+  min-width: 480px;
+  border-collapse: collapse;
+  background: #ffffff;
+  white-space: normal;
+}
+.markdown-table th,
+.markdown-table td {
+  border: 1px solid #d9e0ec;
+  padding: 8px;
+  text-align: left;
+  vertical-align: top;
+}
+.markdown-table th {
+  background: #26385f;
+  color: #ffffff;
+  font-size: 12px;
+}
+.markdown-table th strong {
+  color: #ffffff;
+}
+.markdown-table td:first-child {
+  color: #26385f;
+  font-weight: 800;
+}
 .bubble time { display: block; margin-top: 4px; color: #7b8497; font-size: 11px; }
 .message-row.user time { color: #eef2f8; }
 .bubble-actions {

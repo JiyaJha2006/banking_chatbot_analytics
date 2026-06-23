@@ -119,6 +119,119 @@ function getAuthHeaders() {
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
+function InlineMarkdown({ text }) {
+  const parts = String(text || "").split(/(\*\*[^*]+\*\*)/g);
+  return parts.map((part, index) => {
+    if (part.startsWith("**") && part.endsWith("**")) {
+      return <strong key={`${part}-${index}`}>{part.slice(2, -2)}</strong>;
+    }
+    return <React.Fragment key={`${part}-${index}`}>{part}</React.Fragment>;
+  });
+}
+
+function isMarkdownTableLine(line) {
+  const trimmed = line.trim();
+  return trimmed.startsWith("|") && trimmed.endsWith("|") && trimmed.split("|").length >= 4;
+}
+
+function isMarkdownDividerLine(line) {
+  return /^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?$/.test(line.trim());
+}
+
+function parseTableRow(line) {
+  return line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((cell) => cell.trim());
+}
+
+function MessageContent({ text, role }) {
+  if (role !== "bot") {
+    return <p>{text}</p>;
+  }
+
+  const lines = String(text || "").split("\n");
+  const blocks = [];
+  let index = 0;
+
+  while (index < lines.length) {
+    if (!lines[index].trim()) {
+      index += 1;
+      continue;
+    }
+
+    if (isMarkdownTableLine(lines[index])) {
+      const tableLines = [];
+      while (index < lines.length && (isMarkdownTableLine(lines[index]) || isMarkdownDividerLine(lines[index]))) {
+        if (!isMarkdownDividerLine(lines[index])) {
+          tableLines.push(lines[index]);
+        }
+        index += 1;
+      }
+      if (tableLines.length >= 2) {
+        const [headerLine, ...bodyLines] = tableLines;
+        blocks.push({ type: "table", headers: parseTableRow(headerLine), rows: bodyLines.map(parseTableRow) });
+        continue;
+      }
+      blocks.push({ type: "paragraph", lines: tableLines });
+      continue;
+    }
+
+    const listMatch = lines[index].match(/^\s*(-|\d+\.)\s+(.+)$/);
+    if (listMatch) {
+      const ordered = /^\s*\d+\./.test(lines[index]);
+      const items = [];
+      while (index < lines.length) {
+        const match = lines[index].match(/^\s*(-|\d+\.)\s+(.+)$/);
+        if (!match || (/^\s*\d+\./.test(lines[index]) !== ordered)) break;
+        items.push(match[2]);
+        index += 1;
+      }
+      blocks.push({ type: ordered ? "ol" : "ul", items });
+      continue;
+    }
+
+    const paragraph = [];
+    while (
+      index < lines.length &&
+      lines[index].trim() &&
+      !isMarkdownTableLine(lines[index]) &&
+      !lines[index].match(/^\s*(-|\d+\.)\s+(.+)$/)
+    ) {
+      paragraph.push(lines[index]);
+      index += 1;
+    }
+    blocks.push({ type: "paragraph", lines: paragraph });
+  }
+
+  return (
+    <div className="message-content">
+      {blocks.map((block, blockIndex) => {
+        if (block.type === "table") {
+          return (
+            <div className="markdown-table-wrap" key={`table-${blockIndex}`}>
+              <table className="markdown-table">
+                <thead>
+                  <tr>{block.headers.map((header, cellIndex) => <th key={`${header}-${cellIndex}`}><InlineMarkdown text={header} /></th>)}</tr>
+                </thead>
+                <tbody>
+                  {block.rows.map((row, rowIndex) => (
+                    <tr key={`row-${rowIndex}`}>
+                      {block.headers.map((_, cellIndex) => <td key={`cell-${rowIndex}-${cellIndex}`}><InlineMarkdown text={row[cellIndex] || ""} /></td>)}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          );
+        }
+        if (block.type === "ul" || block.type === "ol") {
+          const ListTag = block.type;
+          return <ListTag key={`list-${blockIndex}`}>{block.items.map((item, itemIndex) => <li key={`${item}-${itemIndex}`}><InlineMarkdown text={item} /></li>)}</ListTag>;
+        }
+        return <p key={`paragraph-${blockIndex}`}>{block.lines.map((line, lineIndex) => <React.Fragment key={`${line}-${lineIndex}`}><InlineMarkdown text={line} />{lineIndex < block.lines.length - 1 && <br />}</React.Fragment>)}</p>;
+      })}
+    </div>
+  );
+}
+
 function getUserStorageId(user) {
   if (!user?.id || !user?.username) return "";
   const safeUsername = String(user.username).trim().toLowerCase().replace(/[^a-z0-9_-]/g, "-");
@@ -949,7 +1062,7 @@ function App() {
                 <article key={message.id} className={`message-row ${message.role}`}>
                   {message.role === "bot" && <div className="avatar">AI</div>}
                   <div className="bubble">
-                    <p>{message.message}</p>
+                    <MessageContent text={message.message} role={message.role} />
                     {message.role === "bot" && message.message && (
                       <div className="bubble-actions">
                         <button type="button" className="read-answer" onClick={() => speakAnswer(message.message)} title={t.readAnswer || "Read answer"}>
