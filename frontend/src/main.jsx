@@ -3,7 +3,8 @@ import { createRoot } from "react-dom/client";
 import { BarChart3, KeyRound, LogIn, LogOut, MessageSquare, Mic, PanelLeftClose, PanelLeftOpen, Plus, Search, SendHorizonal, ShieldCheck, User, Volume2 } from "lucide-react";
 import "./styles.css";
 
-const API_URL = import.meta.env.VITE_API_URL || "/api/chat";
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
+const API_URL = import.meta.env.VITE_API_URL || `${API_BASE_URL}/api/chat`;
 const CHATS_KEY = "banking-chat-chats";
 const ACTIVE_CHAT_KEY = "banking-chat-active";
 const SIDEBAR_KEY = "banking-chat-sidebar-collapsed";
@@ -31,6 +32,10 @@ function getLanguagePath(language) {
 function navigateTo(path) {
   window.history.pushState({}, "", path);
   window.dispatchEvent(new PopStateEvent("popstate"));
+}
+
+function apiUrl(path) {
+  return `${API_BASE_URL}${path}`;
 }
 
 function navigateLanguage(language) {
@@ -223,7 +228,7 @@ function ProfilePage({ authUser, language, onAuthExpired }) {
   useEffect(() => {
     let isCurrent = true;
     setError("");
-    fetch(`/api/profile?user_id=${encodeURIComponent(authUser?.id || "")}`, {
+    fetch(apiUrl(`/api/profile?user_id=${encodeURIComponent(authUser?.id || "")}`), {
       headers: getAuthHeaders()
     })
       .then(async (response) => {
@@ -351,7 +356,7 @@ function AnalyticsPage({ language, onAuthExpired }) {
   useEffect(() => {
     let isCurrent = true;
     setError("");
-    fetch("/api/analytics", { headers: getAuthHeaders() })
+    fetch(apiUrl("/api/analytics"), { headers: getAuthHeaders() })
       .then(async (response) => {
         const data = await response.json();
         if (response.status === 401) {
@@ -439,7 +444,7 @@ function LoginPage({ language, setLanguage, onLogin, routePath }) {
     }
     setError("");
     try {
-      const response = await fetch(isSignup ? "/api/register" : "/api/login", {
+      const response = await fetch(apiUrl(isSignup ? "/api/register" : "/api/login"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ username: username.trim(), password })
@@ -593,7 +598,7 @@ function App() {
       navigateTo(PAGE_ROUTES.login);
       return;
     }
-    fetch("/api/token", { headers: getAuthHeaders() })
+    fetch(apiUrl("/api/token"), { headers: getAuthHeaders() })
       .then((response) => {
         if (!response.ok) throw new Error("Invalid token");
       })
@@ -673,7 +678,7 @@ function App() {
 
   async function handleLogout() {
     try {
-      await fetch("/api/logout", {
+      await fetch(apiUrl("/api/logout"), {
         method: "POST",
         headers: getAuthHeaders()
       });

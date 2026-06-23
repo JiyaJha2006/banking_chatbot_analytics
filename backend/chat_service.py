@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import json
+import os
 import uuid
 import re
 from difflib import SequenceMatcher, get_close_matches
@@ -24,6 +25,7 @@ MEMORY_COLLECTION_NAME = "chat_memory"
 SESSIONS = {}
 BANKING_METADATA_CACHE = {"count": -1, "metadatas": []}
 MODEL_BUNDLE = None
+LIGHTWEIGHT_MODE = os.getenv("LIGHTWEIGHT_MODE", "0").lower() in {"1", "true", "yes"}
 
 BANKING_TOPIC_ALIASES = {
     "savings account": "savings account",
@@ -1039,6 +1041,38 @@ def retrieve_lightweight_banking_answer(query, topic, intent, banking_collection
     return str(metadata.get("answer", "")).strip(), [source]
 
 
+def retrieve_lightweight_official_answer(query, topic="", intent="general"):
+    documents = load_official_kb_documents()
+    ranked = []
+    for metadata in documents:
+        score = lexical_candidate_score(query, metadata, topic, intent)
+        if normalize_match_text(query) == normalize_match_text(metadata.get("question", "")):
+            score += 75.0
+        if score > 0:
+            ranked.append((score, metadata))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+
+    if not ranked:
+        return (
+            "I could not find that in the official banking knowledge base. Please ask about Axis Bank credit cards, fees, rewards, billing, fraud, RBI rules, or account management.",
+            [],
+        )
+
+    score, metadata = ranked[0]
+    methods = ["official_kb", "lexical"]
+    if normalize_match_text(query) == normalize_match_text(metadata.get("question", "")):
+        methods.append("exact")
+    elif SequenceMatcher(None, normalize_match_text(query), normalize_match_text(metadata.get("question", ""))).ratio() >= 0.72:
+        methods.append("fuzzy")
+    source = {
+        **metadata,
+        "dataset": "official_kb",
+        "search_methods": methods,
+        "hybrid_score": round(score, 4),
+    }
+    return str(metadata.get("answer", "")).strip(), [source]
+
+
 def retrieve_chat_memory(search_query, embedding_model, memory_collection, top_k=1):
     if memory_collection.count() == 0:
         return ""
@@ -1634,6 +1668,19 @@ def answer_message(message, language="English", session_id=None):
         }
 
     if not is_banking_related_question(search_question, session):
+        if LIGHTWEIGHT_MODE:
+            reply, general_methods = build_general_reference_answer(message, language)
+            session["chat_history"].append({"role": "bot", "message": reply})
+            return {
+                "session_id": session_id,
+                "reply": reply,
+                "history": session["chat_history"],
+                "sources": [],
+                "suggested_questions": translate_suggested_questions(build_suggested_questions(), language),
+                "topic": "general conversation",
+                "general_chat": True,
+                "search_methods": general_methods,
+            }
         ready_models = get_ready_models()
         if ready_models is not None:
             try:
@@ -1659,6 +1706,27 @@ def answer_message(message, language="English", session_id=None):
             "topic": "general conversation",
             "general_chat": True,
             "search_methods": general_methods,
+        }
+
+    if LIGHTWEIGHT_MODE:
+        reply, sources = retrieve_lightweight_official_answer(resolved_question, topic, intent)
+        reply = translate_answer(reply, language)
+        remember_conversation_context(session, topic, intent, resolved_question)
+        session["chat_history"].append({"role": "bot", "message": reply})
+        return {
+            "session_id": session_id,
+            "reply": reply,
+            "history": session["chat_history"],
+            "sources": sources[:3],
+            "suggested_questions": suggested_questions,
+            "recommendation_card": None,
+            "topic": topic,
+            "rewritten_question": None,
+            "search_methods": sorted({
+                method
+                for source in sources
+                for method in source.get("search_methods", [])
+            } | {"lightweight_official_kb"}),
         }
 
     banking_collection, _ = load_vector_db()

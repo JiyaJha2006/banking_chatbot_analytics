@@ -18,6 +18,7 @@ FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
 FRONTEND_PUBLIC = PROJECT_ROOT / "frontend" / "public"
 HOST = os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("PORT", "8000"))
+LIGHTWEIGHT_MODE = os.getenv("LIGHTWEIGHT_MODE", "0").lower() in {"1", "true", "yes"}
 
 PAGE_LINKS = {
     "login": "/login",
@@ -237,6 +238,9 @@ def main():
     def warm_up_chatbot():
         try:
             ensure_auth_tables()
+            if LIGHTWEIGHT_MODE:
+                print("Lightweight mode enabled. Skipping chatbot model startup.", flush=True)
+                return
             print("Loading chatbot models in the background. First answer may take a while...", flush=True)
             load_models()
             load_vector_db()
