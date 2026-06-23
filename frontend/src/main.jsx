@@ -3,7 +3,9 @@ import { createRoot } from "react-dom/client";
 import { BarChart3, KeyRound, LogIn, LogOut, MessageSquare, Mic, PanelLeftClose, PanelLeftOpen, Plus, Search, SendHorizonal, ShieldCheck, User, Volume2 } from "lucide-react";
 import "./styles.css";
 
-const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
+const RAILWAY_API_BASE_URL = "https://bankingchatbotanalytics-production.up.railway.app";
+const isNetlifyHost = typeof window !== "undefined" && window.location.hostname.endsWith(".netlify.app");
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || (isNetlifyHost ? RAILWAY_API_BASE_URL : "")).replace(/\/$/, "");
 const API_URL = import.meta.env.VITE_API_URL || `${API_BASE_URL}/api/chat`;
 const CHATS_KEY = "banking-chat-chats";
 const ACTIVE_CHAT_KEY = "banking-chat-active";
