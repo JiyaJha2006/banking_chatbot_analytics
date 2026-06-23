@@ -1,0 +1,16 @@
+services:
+  banking-chatbot:
+    build: .
+    container_name: banking-chatbot
+    restart: unless-stopped
+    ports:
+      - "7860:7860"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 7860
+      OPEN_BROWSER: 0
+      DATABASE_BACKEND: sqlite
+      SQLITE_DB_PATH: /app/data/chatbot_app.sqlite3
+      PYTHONUNBUFFERED: 1
+    volumes:
+      - ./data:/app/data

@@ -19,7 +19,7 @@ ENV PIP_NO_CACHE_DIR=1
 WORKDIR /app
 
 COPY requirements.txt ./
-RUN pip install --index-url https://download.pytorch.org/whl/cpu torch==2.7.1
+RUN pip install --index-url https://download.pytorch.org/whl/cpu torch==2.7.1 || pip install torch==2.7.1
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py README.md ./
