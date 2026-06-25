@@ -87,7 +87,8 @@ BANKING_VOCABULARY = set(
     "suspicious", "ombudsman", "escalate", "escalation", "reward", "rewards",
     "points", "edge", "redeem", "redemption", "cashback", "bill", "billing",
     "due", "emi", "approval", "approved", "consent", "liability", "rbi",
-    "annual", "joining", "limit", "limits", "cardholder",
+    "annual", "joining", "limit", "limits", "cardholder", "phishing", "vishing",
+    "skimming", "malware", "spoofing", "harassment",
 }
 
 QUERY_WORDS = {
@@ -116,7 +117,7 @@ SENSITIVE_PERSONAL_TERMS = [
     "sort code", "aadhaar", "aadhar", "pan number", "passport number", "social security",
     "ssn", "date of birth", "dob", "address", "phone number", "mobile number", "email",
     "login id", "user id", "username", "security answer", "secret answer", "mother's maiden",
-    "balance", "transaction history", "bank statement",
+    "balance", "transaction", "transactions", "transaction history", "bank statement",
 ]
 
 SENSITIVE_REQUEST_PATTERNS = [
@@ -248,6 +249,7 @@ def get_session(session_id=None):
         "last_resolved_question": "",
         "last_kb_source": {},
         "kb_source_history": [],
+        "last_comparison": {},
     })
     return session_id, SESSIONS[session_id]
 
@@ -259,9 +261,17 @@ def is_follow_up_question(user_question):
         "about it", "for that", "about that", "how much", "what documents",
         "documents needed", "required documents", "explain more", "tell me more",
         "what about", "does it", "can it", "is it", "which is better",
-        "better one", "how long", "what next", "then what",
+        "better one", "how long", "what next", "then what", "what should i do next",
+        "where do i file", "file online", "how long should i wait",
     ]
     if any(re.search(rf"\b{re.escape(phrase)}\b", q) for phrase in phrases):
+        return True
+    short_follow_up_terms = {
+        "late", "interest", "fee", "fees", "charge", "charges", "cashback", "reward",
+        "rewards", "points", "documents", "limit", "limits", "online", "next",
+        "complaint", "resolve", "resolved", "solve", "solved", "delay", "delayed",
+    }
+    if len(q.split()) <= 3 and search_tokens(q) & short_follow_up_terms:
         return True
     intent = detect_question_intent(q)
     return len(q.split()) <= 7 and intent in {
@@ -410,7 +420,7 @@ def build_contextual_retrieval_query(query, session):
 def detect_question_intent(question):
     q = question.lower().strip()
     intent_rules = [
-        ("dispute", ["dispute", "complaint", "complain", "chargeback", "fraud", "fraudulent", "unauthorized", "unauthorised", "suspicious", "strange activity", "report", "block card", "lost card", "stolen card", "ombudsman", "escalate", "escalation"]),
+        ("dispute", ["dispute", "complaint", "complain", "chargeback", "fraud", "fraudulent", "unauthorized", "unauthorised", "suspicious", "strange activity", "report", "block card", "lost card", "stolen card", "ombudsman", "escalate", "escalation", "resolve", "resolved", "unresolved", "solve", "solved"]),
         ("documents", ["document", "documents", "proof", "kyc", "required", "requirement", "need to carry", "needed"]),
         ("fees", ["fee", "fees", "charge", "charges", "cost", "minimum balance", "penalty"]),
         ("interest", ["interest rate", "rate of interest", "returns", "interest earned", "how much interest"]),
@@ -1053,22 +1063,45 @@ def search_tokens(text):
 def expand_query_terms(text):
     terms = set(search_tokens(text))
     q = str(text or "").lower()
-    if any(phrase in q for phrase in ["how long", "how many days", "when", "timeline", "take", "delay", "late"]):
+    if any(phrase in q for phrase in ["how long", "how many days", "when", "timeline", "take", "delay", "late", "wait"]):
         terms |= {"time", "timeline", "day", "working", "process", "processed", "processing", "review", "reviewed", "delay", "delayed"}
     if any(phrase in q for phrase in ["what happens", "what if", "only pay", "after", "miss"]):
-        terms |= {"happen", "result", "consequence", "impact", "charge", "interest", "fee"}
+        terms |= {"happen", "result", "consequence", "impact", "charge", "interest", "fee", "forfeit", "forfeited", "redeem", "closure", "closed"}
+    if terms & {"cashback", "reward", "rewards", "points"}:
+        terms |= {"cashback", "reward", "rewards", "point", "points", "edge"}
+    if terms & {"mile", "miles"}:
+        terms |= {"mile", "miles", "edge", "travel"}
+    if any(phrase in q for phrase in ["best for", "who should", "who can use", "should use", "right for"]):
+        terms |= {"best", "for", "suitable", "recommended", "goal", "use", "traveller", "spender", "shopper"}
+    if any(phrase in q for phrase in ["report phishing", "phishing", "vishing", "skimming", "what should i do next"]):
+        terms |= {"report", "fraud", "phishing", "security", "dispute", "customer", "care", "block", "email", "call"}
+    if terms & {"complaint", "complain", "resolve", "unresolved"}:
+        terms |= {"complaint", "complain", "resolve", "unresolved", "grievance", "ombudsman", "escalation", "escalate", "satisfactory", "responded"}
     return terms
 
 
 def normalize_search_token(token):
     token = token.lower()
+    synonyms = {
+        "solve": "resolve",
+        "solved": "resolve",
+        "resolves": "resolve",
+        "resolved": "resolve",
+        "delay": "delayed",
+        "late": "delayed",
+        "cheaper": "lower",
+        "lowest": "lower",
+        "better": "best",
+    }
+    if token in synonyms:
+        return synonyms[token]
     if len(token) > 5 and token.endswith("ies"):
         return f"{token[:-3]}y"
     if len(token) > 5 and token.endswith("ing"):
         return token[:-3]
     if len(token) > 4 and token.endswith("ed"):
         return token[:-2]
-    if len(token) > 4 and token.endswith("s") and not token.endswith("ss"):
+    if len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
         return token[:-1]
     return token
 
@@ -1126,6 +1159,9 @@ def build_previous_answer_candidate(current_query, previous_source):
     ranked_units = []
     temporal_query = bool(re.search(r"\b(how long|how many days|when|timeline|take|delay|late)\b", str(current_query or "").lower()))
     temporal_terms = {"time", "timeline", "day", "working", "process", "processed", "processing", "review", "reviewed", "delay", "delayed", "approval", "approved"}
+    required_temporal_terms = expand_query_terms(current_query) & {"investigation", "approval", "closure", "complaint", "dispute", "chargeback"}
+    action_followup = bool(re.search(r"\b(next|what should i do|what do i do)\b", str(current_query or "").lower()))
+    action_terms = {"report", "call", "email", "visit", "file", "block", "contact", "request", "submit", "redeem"}
     for index, unit in enumerate(split_answer_units(answer)):
         unit_text = unit["text"]
         if "see chunk" in unit_text.lower():
@@ -1137,8 +1173,15 @@ def build_previous_answer_candidate(current_query, previous_source):
         hits = query_terms & unit_terms
         if temporal_query and not (unit_text_terms & temporal_terms):
             continue
-        if not hits:
+        if temporal_query and required_temporal_terms and not (unit_text_terms & required_temporal_terms):
             continue
+        if action_followup and not (unit_text_terms & action_terms):
+            continue
+        if not hits:
+            if action_followup and (unit_text_terms & action_terms):
+                hits = unit_text_terms & action_terms
+            else:
+                continue
         coverage = len(hits) / len(query_terms)
         density = len(hits) / max(len(unit_terms), 1)
         order_bonus = max(0.0, 1.0 - index * 0.03)
@@ -1149,7 +1192,8 @@ def build_previous_answer_candidate(current_query, previous_source):
         return None
     ranked_units.sort(key=lambda item: item[0], reverse=True)
     best_score = ranked_units[0][0]
-    if best_score < 9.0:
+    min_score = 4.0 if temporal_query else 9.0
+    if best_score < min_score:
         return None
 
     selected_indexes = sorted(index for _, index, _ in ranked_units[:4])
@@ -1166,7 +1210,7 @@ def build_previous_answer_candidate(current_query, previous_source):
     if not snippet:
         return None
 
-    context_bonus = 20.0 if len(query_terms) == 1 else 45.0
+    context_bonus = 60.0 if temporal_query else 20.0 if len(query_terms) == 1 else 45.0
     return {
         "score": round(best_score + context_bonus, 4),
         "metadata": {
@@ -1181,6 +1225,10 @@ def build_previous_answer_candidate(current_query, previous_source):
             "hybrid_score": round(best_score + context_bonus, 4),
         },
     }
+
+
+def is_pronoun_reference(question):
+    return bool(re.search(r"\b(it|that|this|they|them|those|these)\b", str(question or "").lower()))
 
 
 def candidate_key(metadata):
@@ -1229,7 +1277,7 @@ def lexical_candidate_score(query, metadata, topic="", intent="general"):
     topic_bonus = score_topic_match(topic, candidate_text)
     intent_bonus = score_intent_match(intent, candidate_text)
     query_bonus = score_query_specific_match(query_text, question.lower(), candidate_text)
-    return exact_bonus + overlap * 7.0 + question_overlap * 18.0 + len(question_hits) * 4.0 + question_ratio * 3.0 + phrase_bonus + topic_bonus + intent_bonus + query_bonus
+    return exact_bonus + overlap * 6.0 + question_overlap * 24.0 + len(question_hits) * 7.0 + question_ratio * 3.0 + phrase_bonus + topic_bonus + intent_bonus + query_bonus
 
 
 def score_query_specific_match(query_text, question_text, candidate_text):
@@ -1242,7 +1290,16 @@ def score_query_specific_match(query_text, question_text, candidate_text):
     body_hits = query_terms & candidate_terms
     title_coverage = len(title_hits) / len(query_terms)
     body_coverage = len(body_hits) / len(query_terms)
-    return title_coverage * 10.0 + body_coverage * 3.0
+    score = title_coverage * 10.0 + body_coverage * 3.0
+    if "mile" in question_terms and "mile" not in query_terms:
+        score -= 45.0
+    complaint_terms = {"complaint", "complain", "resolve", "unresolved", "grievance", "ombudsman", "escalation"}
+    if query_terms & complaint_terms:
+        if question_terms & complaint_terms:
+            score += 28.0
+        elif not (candidate_terms & complaint_terms):
+            score -= 10.0
+    return score
 
 
 def retrieve_hybrid_banking_context(
@@ -1425,7 +1482,7 @@ def retrieve_lightweight_official_answer(query, topic="", intent="general", sess
 
     previous_answer_candidates = []
     if follow_up:
-        recent_sources = list(session.get("kb_source_history") or [])
+        recent_sources = [previous_source] if is_pronoun_reference(current_query) and previous_source else list(session.get("kb_source_history") or [])
         if previous_source:
             source_key = (previous_source.get("source_file", ""), previous_source.get("question", ""))
             if not any((item.get("source_file", ""), item.get("question", "")) == source_key for item in recent_sources):
@@ -1840,6 +1897,48 @@ def compare_products(question):
     }
 
 
+def answer_comparison_followup(question, session):
+    table = session.get("last_comparison") or {}
+    if not table:
+        return None
+    q_terms = expand_query_terms(question)
+    if not q_terms:
+        return None
+    columns = table.get("columns") or []
+    rows = table.get("rows") or []
+    if len(columns) < 3 or not rows:
+        return None
+
+    ranked_rows = []
+    for row in rows:
+        feature = str(row.get("feature", ""))
+        row_text = " ".join(str(value) for value in row.values())
+        terms = expand_query_terms(f"{feature} {row_text}")
+        hits = q_terms & terms
+        if hits:
+            ranked_rows.append((len(hits), feature, row))
+    if not ranked_rows:
+        return None
+    ranked_rows.sort(key=lambda item: item[0], reverse=True)
+    _, feature, row = ranked_rows[0]
+    left, right = columns[1], columns[2]
+    left_value = str(row.get(left, "-"))
+    right_value = str(row.get(right, "-"))
+
+    lower_words = {"lower", "less", "cheap", "cheaper", "lowest"}
+    shopping_words = {"shopping", "shop", "online", "flipkart", "myntra"}
+    cashback_words = {"cashback", "reward", "rewards"}
+    if q_terms & lower_words:
+        answer = f"For {feature.lower()}, {left} has: {left_value}. {right} has: {right_value}."
+    elif q_terms & shopping_words:
+        answer = f"For shopping, compare the '{feature}' row: {left}: {left_value}. {right}: {right_value}."
+    elif q_terms & cashback_words:
+        answer = f"For cashback/rewards, {left}: {left_value}. {right}: {right_value}."
+    else:
+        answer = f"For {feature.lower()}, {left}: {left_value}. {right}: {right_value}."
+    return answer
+
+
 def is_account_recommendation_question(question):
     q = question.lower()
     phrases = ["which account", "what account", "account should i open", "recommend account", "recommend an account", "best account", "suitable account", "suggest account", "suggest an account", "open for me"]
@@ -2086,6 +2185,7 @@ def answer_message(message, language="English", session_id=None):
         logger.info("answer.route comparison session_id=%s topic=%s", session_id, comparison.get("topic", ""))
         reply = translate_answer(comparison["reply"], language)
         remember_conversation_context(session, comparison["topic"], "comparison", comparison["topic"])
+        session["last_comparison"] = comparison["comparison_table"]
         session["chat_history"].append({"role": "bot", "message": reply})
         return {
             "session_id": session_id,
@@ -2099,6 +2199,21 @@ def answer_message(message, language="English", session_id=None):
             ], language),
             "comparison_table": comparison["comparison_table"],
             "topic": comparison["topic"],
+        }
+
+    comparison_followup = answer_comparison_followup(search_question, session)
+    if comparison_followup:
+        logger.info("answer.route comparison_followup session_id=%s question=%s", session_id, log_text(search_question))
+        reply = translate_answer(comparison_followup, language)
+        session["chat_history"].append({"role": "bot", "message": reply})
+        return {
+            "session_id": session_id,
+            "reply": reply,
+            "history": session["chat_history"],
+            "sources": [],
+            "suggested_questions": suggested_questions,
+            "topic": session.get("current_topic", ""),
+            "search_methods": ["comparison_context"],
         }
 
     if is_account_recommendation_question(search_question):
