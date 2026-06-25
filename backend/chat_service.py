@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import json
+import logging
 import os
 import uuid
 import re
@@ -26,6 +27,12 @@ SESSIONS = {}
 BANKING_METADATA_CACHE = {"count": -1, "metadatas": []}
 MODEL_BUNDLE = None
 LIGHTWEIGHT_MODE = os.getenv("LIGHTWEIGHT_MODE", "0").lower() in {"1", "true", "yes"}
+logger = logging.getLogger("banking_chatbot.chat")
+
+
+def log_text(value, max_length=160):
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= max_length else f"{text[:max_length]}..."
 
 BANKING_TOPIC_ALIASES = {
     "savings account": "savings account",
@@ -71,11 +78,13 @@ BANKING_VOCABULARY = set(
     " ".join(BANKING_TOPIC_ALIASES).split()
 ) | {
     "account", "bank", "banking", "balance", "branch", "cash", "charge",
-    "deposit", "document", "eligibility", "fee", "interest", "loan", "money",
+    "complaint", "deposit", "dispute", "document", "eligibility", "fee", "fraud",
+    "interest", "loan", "money",
     "nominee", "password", "payment", "pin", "statement", "transaction",
     "transfer", "withdrawal", "apply", "open", "activate", "documents",
     "required", "salaried", "self-employed", "compare", "benefits", "fees",
-    "charges", "steps",
+    "charges", "steps", "chargeback", "unauthorized", "unauthorised",
+    "suspicious", "ombudsman", "escalate", "escalation",
 }
 
 QUERY_WORDS = {
@@ -234,6 +243,7 @@ def get_session(session_id=None):
         "current_intent": "general",
         "topic_history": [],
         "last_resolved_question": "",
+        "last_kb_source": {},
     })
     return session_id, SESSIONS[session_id]
 
@@ -251,7 +261,7 @@ def is_follow_up_question(user_question):
         return True
     intent = detect_question_intent(q)
     return len(q.split()) <= 7 and intent in {
-        "documents", "fees", "interest", "tenure", "limits", "eligibility", "opening", "process"
+        "documents", "fees", "interest", "tenure", "limits", "eligibility", "opening", "process", "dispute"
     }
 
 
@@ -279,6 +289,13 @@ def resolve_question_context(user_question, session):
     current_topic = str(session.get("current_topic", "")).strip()
     explicit_topic = extract_topic_from_question(user_question)
     if explicit_topic or not current_topic or not is_follow_up_question(user_question):
+        logger.info(
+            "context.resolve passthrough explicit_topic=%s current_topic=%s follow_up=%s question=%s",
+            explicit_topic or "",
+            current_topic or "",
+            is_follow_up_question(user_question),
+            log_text(user_question),
+        )
         return user_question
 
     resolved = f" {user_question.strip()} "
@@ -287,11 +304,19 @@ def resolve_question_context(user_question, session):
     resolved = " ".join(resolved.split())
     if current_topic.lower() not in resolved.lower():
         resolved = f"{resolved} about {current_topic}"
+    logger.info(
+        "context.resolve follow_up current_topic=%s original=%s resolved=%s",
+        current_topic,
+        log_text(user_question),
+        log_text(resolved),
+    )
     return resolved
 
 
 def remember_conversation_context(session, topic="", intent="general", resolved_question=""):
     topic = normalize_topic_label(topic)
+    previous_topic = session.get("current_topic", "")
+    previous_intent = session.get("current_intent", "general")
     if topic and topic.lower() not in {"account recommendation", "banking", "bank"}:
         previous = session.get("current_topic", "")
         if previous and previous != topic:
@@ -304,11 +329,52 @@ def remember_conversation_context(session, topic="", intent="general", resolved_
         session["current_intent"] = intent
     if resolved_question:
         session["last_resolved_question"] = resolved_question
+    logger.info(
+        "context.remember previous_topic=%s new_topic=%s previous_intent=%s new_intent=%s resolved_question=%s topic_history=%s",
+        previous_topic or "",
+        session.get("current_topic", ""),
+        previous_intent,
+        session.get("current_intent", "general"),
+        log_text(resolved_question),
+        session.get("topic_history", []),
+    )
+
+
+def remember_kb_source_context(session, source):
+    if not source:
+        return
+    session["last_kb_source"] = {
+        "section": str(source.get("section", "")),
+        "question": str(source.get("question", "")),
+        "source_file": str(source.get("source_file", "")),
+        "answer_preview": log_text(source.get("answer", ""), 280),
+    }
+    logger.info(
+        "context.kb_source_remember section=%s question=%s source_file=%s",
+        session["last_kb_source"].get("section", ""),
+        log_text(session["last_kb_source"].get("question", "")),
+        session["last_kb_source"].get("source_file", ""),
+    )
+
+
+def build_contextual_retrieval_query(query, session):
+    source = session.get("last_kb_source") or {}
+    if not source:
+        return query
+    context_text = " ".join([
+        source.get("section", ""),
+        source.get("question", ""),
+        source.get("answer_preview", ""),
+    ]).strip()
+    if not context_text:
+        return query
+    return f"{query} previous context: {context_text}"
 
 
 def detect_question_intent(question):
     q = question.lower().strip()
     intent_rules = [
+        ("dispute", ["dispute", "complaint", "complain", "chargeback", "fraud", "fraudulent", "unauthorized", "unauthorised", "suspicious", "strange activity", "report", "block card", "lost card", "stolen card", "ombudsman", "escalate", "escalation"]),
         ("documents", ["document", "documents", "proof", "kyc", "required", "requirement", "need to carry", "needed"]),
         ("fees", ["fee", "fees", "charge", "charges", "cost", "minimum balance", "penalty"]),
         ("interest", ["interest rate", "rate of interest", "returns", "interest earned", "how much interest"]),
@@ -332,6 +398,8 @@ def build_intent_search_query(search_query, intent):
         return f"documents required proof KYC needed for {search_query}"
     if intent == "process":
         return f"steps process procedure how to {search_query}"
+    if intent == "dispute":
+        return f"dispute chargeback fraud complaint ombudsman unauthorized suspicious lost stolen block report {search_query}"
     if intent == "fees":
         return f"fees charges minimum balance cost for {search_query}"
     if intent == "eligibility":
@@ -484,17 +552,34 @@ def build_clarifying_question(message, topic, intent, session):
 def should_use_form_assistant(question, topic, intent):
     category = detect_product_category(topic)
     if not category:
+        logger.info("route.form_assistant skip reason=no_category topic=%s intent=%s question=%s", topic, intent, log_text(question))
         return False
     q = str(question or "").lower()
     security_words = [
         "block", "blocked", "lost", "stolen", "fraud", "fraudulent", "unauthorized",
         "unauthorised", "dispute", "chargeback", "phishing", "vishing", "skimming",
-        "suspicious", "security", "replace card", "replacement card",
+        "suspicious", "security", "replace card", "replacement card", "complaint",
+        "complain", "ombudsman", "escalate", "escalation", "report",
     ]
     if any(word in q for word in security_words):
+        logger.info(
+            "route.form_assistant skip reason=security_or_dispute topic=%s intent=%s question=%s",
+            topic,
+            intent,
+            log_text(question),
+        )
         return False
     action_words = ["apply", "open", "make", "create", "start", "documents", "required", "needed", "how do", "how can", "steps", "process"]
-    return intent in {"opening", "documents", "process"} or any(word in q for word in action_words)
+    decision = intent in {"opening", "documents", "process"} or any(word in q for word in action_words)
+    logger.info(
+        "route.form_assistant decision=%s category=%s topic=%s intent=%s question=%s",
+        decision,
+        category,
+        topic,
+        intent,
+        log_text(question),
+    )
+    return decision
 
 
 def is_credential_help_question(question):
@@ -907,15 +992,35 @@ def lexical_candidate_score(query, metadata, topic="", intent="general"):
     query_text = query.lower().strip()
     query_terms = search_tokens(query_text)
     candidate_terms = search_tokens(candidate_text)
+    question_terms = search_tokens(question.lower())
     if not query_terms:
         return 0.0
     overlap = len(query_terms & candidate_terms) / len(query_terms)
+    question_overlap = len(query_terms & question_terms) / len(query_terms)
     question_ratio = SequenceMatcher(None, query_text, question.lower()).ratio()
     phrase_bonus = 5.0 if query_text and query_text in candidate_text else 0.0
     exact_bonus = 100.0 if normalize_match_text(query_text) == normalize_match_text(question) else 0.0
     topic_bonus = score_topic_match(topic, candidate_text)
     intent_bonus = score_intent_match(intent, candidate_text)
-    return exact_bonus + overlap * 7.0 + question_ratio * 3.0 + phrase_bonus + topic_bonus + intent_bonus
+    query_bonus = score_query_specific_match(query_text, question.lower(), candidate_text)
+    return exact_bonus + overlap * 7.0 + question_overlap * 8.0 + question_ratio * 3.0 + phrase_bonus + topic_bonus + intent_bonus + query_bonus
+
+
+def score_query_specific_match(query_text, question_text, candidate_text):
+    score = 0.0
+    if "file" in query_text and "dispute" in query_text:
+        if "file a dispute" in question_text:
+            score += 30.0
+        elif "file a dispute" in candidate_text:
+            score += 5.0
+        if "chargeback" in candidate_text or "transaction dispute" in candidate_text:
+            score += 8.0
+    if any(word in query_text for word in ["complaint", "complain", "ombudsman", "escalate", "escalation"]):
+        if any(phrase in question_text for phrase in ["right to complain", "complaint", "ombudsman", "escalate"]):
+            score += 35.0
+        if any(phrase in candidate_text for phrase in ["rbi ombudsman", "complaint", "grievance", "escalate"]):
+            score += 10.0
+    return score
 
 
 def retrieve_hybrid_banking_context(
@@ -1048,18 +1153,49 @@ def retrieve_lightweight_banking_answer(query, topic, intent, banking_collection
     return str(metadata.get("answer", "")).strip(), [source]
 
 
-def retrieve_lightweight_official_answer(query, topic="", intent="general"):
+def retrieve_lightweight_official_answer(query, topic="", intent="general", session=None, follow_up=False):
     documents = load_official_kb_documents()
     ranked = []
+    session = session or {}
+    previous_source = session.get("last_kb_source") or {}
+    contextual_query = build_contextual_retrieval_query(query, session) if follow_up else query
+    logger.info(
+        "retrieve.official.start query=%s contextual_query=%s topic=%s intent=%s follow_up=%s documents=%s previous_section=%s previous_question=%s previous_source_file=%s",
+        log_text(query),
+        log_text(contextual_query),
+        topic or "",
+        intent,
+        follow_up,
+        len(documents),
+        previous_source.get("section", ""),
+        log_text(previous_source.get("question", "")),
+        previous_source.get("source_file", ""),
+    )
     for metadata in documents:
         score = lexical_candidate_score(query, metadata, topic, intent)
+        if follow_up and contextual_query != query:
+            score += lexical_candidate_score(contextual_query, metadata, topic, intent) * 0.35
+            if previous_source.get("source_file") and metadata.get("source_file") == previous_source.get("source_file"):
+                score += 4.0
+            elif previous_source.get("section") and metadata.get("section") == previous_source.get("section"):
+                score += 2.0
         if normalize_match_text(query) == normalize_match_text(metadata.get("question", "")):
             score += 75.0
         if score > 0:
             ranked.append((score, metadata))
     ranked.sort(key=lambda item: item[0], reverse=True)
+    for rank, (score, metadata) in enumerate(ranked[:5], 1):
+        logger.info(
+            "retrieve.official.candidate rank=%s score=%.4f section=%s question=%s source_file=%s",
+            rank,
+            score,
+            metadata.get("section", ""),
+            log_text(metadata.get("question", "")),
+            metadata.get("source_file", ""),
+        )
 
     if not ranked:
+        logger.warning("retrieve.official.no_match query=%s topic=%s intent=%s", log_text(query), topic or "", intent)
         return (
             "I could not find that in the official banking knowledge base. Please ask about Axis Bank credit cards, fees, rewards, billing, fraud, RBI rules, or account management.",
             [],
@@ -1077,6 +1213,14 @@ def retrieve_lightweight_official_answer(query, topic="", intent="general"):
         "search_methods": methods,
         "hybrid_score": round(score, 4),
     }
+    logger.info(
+        "retrieve.official.selected score=%.4f methods=%s section=%s question=%s source_file=%s",
+        score,
+        methods,
+        metadata.get("section", ""),
+        log_text(metadata.get("question", "")),
+        metadata.get("source_file", ""),
+    )
     return str(metadata.get("answer", "")).strip(), [source]
 
 
@@ -1105,6 +1249,7 @@ def score_intent_match(intent, candidate_text):
         "opening": ["open", "opening", "apply", "register", "walk into", "nearest branch", "submit", "carry", "documents", "account opening"],
         "documents": ["documents", "proof", "kyc", "identity proof", "address proof", "photograph", "required", "carry"],
         "process": ["steps", "process", "procedure", "follow", "submit", "visit", "log in", "click", "fill"],
+        "dispute": ["dispute", "chargeback", "fraud", "fraudulent", "unauthorized", "unauthorised", "complaint", "ombudsman", "block", "lost", "stolen", "suspicious", "report fraud", "transaction not initiated"],
         "fees": ["fee", "fees", "charge", "charges", "cost", "minimum balance", "penalty"],
         "interest": ["interest", "interest rate", "rate of interest", "returns", "earned"],
         "tenure": ["tenure", "duration", "maturity", "period", "months", "years"],
@@ -1116,6 +1261,7 @@ def score_intent_match(intent, candidate_text):
         "opening": ["what is", "meaning", "basic bank account", "is a type", "is an account", "allows you to"],
         "documents": ["what is", "meaning", "is a type"],
         "process": ["what is", "meaning", "is a type"],
+        "dispute": ["emi conversion", "apply for", "eligible to apply", "annual fee waived", "reward points", "cashback", "increase or decrease", "credit limit"],
         "definition": ["steps", "submit", "visit", "documents required", "opening"],
     }
     score = 0.0
@@ -1545,7 +1691,18 @@ def answer_message(message, language="English", session_id=None):
         language = "English"
 
     session_id, session = get_session(session_id)
+    logger.info(
+        "answer.start session_id=%s language=%s lightweight=%s message=%s history_count=%s current_topic=%s current_intent=%s",
+        session_id,
+        language,
+        LIGHTWEIGHT_MODE,
+        log_text(message),
+        len(session.get("chat_history", [])),
+        session.get("current_topic", ""),
+        session.get("current_intent", "general"),
+    )
     if is_sensitive_personal_question(message):
+        logger.info("answer.route privacy_guard session_id=%s message=%s", session_id, log_text(message))
         reply = build_sensitive_personal_refusal(language)
         session["chat_history"].append({"role": "user", "message": message})
         session["chat_history"].append({"role": "bot", "message": reply})
@@ -1573,8 +1730,31 @@ def answer_message(message, language="English", session_id=None):
     topic = extract_topic_from_question(resolved_question)
     if not topic and is_follow_up_question(search_question):
         topic = session.get("current_topic", "")
+    if not topic and session.get("current_topic") and intent in {"dispute", "documents", "fees", "interest", "tenure", "limits", "eligibility", "opening", "process"}:
+        topic = session.get("current_topic", "")
+        resolved_question = resolve_question_context(f"{search_question} about {topic}", session)
+        logger.info(
+            "answer.topic_fallback session_id=%s inherited_topic=%s resolved=%s intent=%s",
+            session_id,
+            topic,
+            log_text(resolved_question),
+            intent,
+        )
+    logger.info(
+        "answer.analysis session_id=%s translated=%s search=%s resolved=%s follow_up=%s intent=%s topic=%s current_topic=%s topic_history=%s",
+        session_id,
+        log_text(translated_question),
+        log_text(search_question),
+        log_text(resolved_question),
+        is_follow_up_question(search_question),
+        intent,
+        topic or "",
+        session.get("current_topic", ""),
+        session.get("topic_history", []),
+    )
     session["chat_history"].append({"role": "user", "message": message})
     if is_credential_help_question(search_question):
+        logger.info("answer.route credential_help session_id=%s topic=%s intent=%s", session_id, topic or "", intent)
         reply = build_credential_help_answer(search_question, language)
         remember_conversation_context(session, "banking password" if "password" in search_question else "banking PIN", "process", resolved_question)
         session["chat_history"].append({"role": "bot", "message": reply})
@@ -1593,6 +1773,7 @@ def answer_message(message, language="English", session_id=None):
 
     comparison = compare_products(search_question)
     if comparison:
+        logger.info("answer.route comparison session_id=%s topic=%s", session_id, comparison.get("topic", ""))
         reply = translate_answer(comparison["reply"], language)
         remember_conversation_context(session, comparison["topic"], "comparison", comparison["topic"])
         session["chat_history"].append({"role": "bot", "message": reply})
@@ -1612,6 +1793,7 @@ def answer_message(message, language="English", session_id=None):
 
     pending_reply = handle_pending_flow(search_question, session)
     if pending_reply:
+        logger.info("answer.route pending_flow session_id=%s response_topic=%s intent=%s", session_id, pending_flow_topic or topic, intent)
         response_topic = pending_flow_topic or topic
         response_suggestions = translate_suggested_questions(build_suggested_questions(response_topic, intent), language)
         reply = translate_answer(pending_reply, language)
@@ -1628,6 +1810,7 @@ def answer_message(message, language="English", session_id=None):
 
     clarifying_reply = build_clarifying_question(search_question, topic, intent, session)
     if clarifying_reply:
+        logger.info("answer.route clarifying_question session_id=%s topic=%s intent=%s", session_id, topic or "", intent)
         reply = translate_answer(clarifying_reply, language)
         remember_conversation_context(session, topic, intent, resolved_question)
         session["chat_history"].append({"role": "bot", "message": reply})
@@ -1641,9 +1824,12 @@ def answer_message(message, language="English", session_id=None):
         }
 
     if should_use_form_assistant(resolved_question, topic, intent):
+        logger.info("answer.route form_assistant session_id=%s topic=%s intent=%s resolved=%s", session_id, topic or "", intent, log_text(resolved_question))
         reply = build_form_assistant_answer(topic, intent, search_question)
         reply = translate_answer(reply, language)
         remember_conversation_context(session, topic, intent, resolved_question)
+        if sources:
+            remember_kb_source_context(session, sources[0])
         session["chat_history"].append({"role": "bot", "message": reply})
         return {
             "session_id": session_id,
@@ -1655,6 +1841,7 @@ def answer_message(message, language="English", session_id=None):
         }
 
     if is_account_recommendation_question(search_question):
+        logger.info("answer.route recommendation session_id=%s question=%s", session_id, log_text(search_question))
         reply, recommendation_card = recommend_account(search_question)
         reply = translate_answer(reply, language)
         recommendation_topic = recommendation_card.get("account", "account recommendation")
@@ -1676,6 +1863,7 @@ def answer_message(message, language="English", session_id=None):
 
     if not is_banking_related_question(search_question, session):
         if LIGHTWEIGHT_MODE:
+            logger.info("answer.route lightweight_general session_id=%s question=%s", session_id, log_text(message))
             reply, general_methods = build_general_reference_answer(message, language)
             session["chat_history"].append({"role": "bot", "message": reply})
             return {
@@ -1689,6 +1877,7 @@ def answer_message(message, language="English", session_id=None):
                 "search_methods": general_methods,
             }
         ready_models = get_ready_models()
+        logger.info("answer.route general session_id=%s ready_models=%s", session_id, ready_models is not None)
         if ready_models is not None:
             try:
                 _, _, tokenizer, llm_model = ready_models
@@ -1716,9 +1905,18 @@ def answer_message(message, language="English", session_id=None):
         }
 
     if LIGHTWEIGHT_MODE:
-        reply, sources = retrieve_lightweight_official_answer(resolved_question, topic, intent)
+        logger.info("answer.route lightweight_official session_id=%s topic=%s intent=%s resolved=%s", session_id, topic or "", intent, log_text(resolved_question))
+        reply, sources = retrieve_lightweight_official_answer(
+            resolved_question,
+            topic,
+            intent,
+            session=session,
+            follow_up=is_follow_up_question(search_question) or bool(session.get("last_kb_source") and topic == session.get("current_topic")),
+        )
         reply = translate_answer(reply, language)
         remember_conversation_context(session, topic, intent, resolved_question)
+        if sources:
+            remember_kb_source_context(session, sources[0])
         session["chat_history"].append({"role": "bot", "message": reply})
         return {
             "session_id": session_id,
@@ -1739,6 +1937,7 @@ def answer_message(message, language="English", session_id=None):
     banking_collection, _ = load_vector_db()
     ready_models = get_ready_models()
     if ready_models is None:
+        logger.info("answer.route chroma_lightweight_fallback session_id=%s topic=%s intent=%s", session_id, topic or "", intent)
         reply, sources = retrieve_lightweight_banking_answer(
             resolved_question,
             topic,
@@ -1767,8 +1966,10 @@ def answer_message(message, language="English", session_id=None):
     embedding_model, reranker_model, tokenizer, llm_model = ready_models
     rewritten_question = ""
     if question_needs_llm_rewrite(resolved_question, session):
+        logger.info("answer.rewrite.start session_id=%s resolved=%s current_topic=%s", session_id, log_text(resolved_question), session.get("current_topic", ""))
         rewritten_question = rewrite_unclear_question(resolved_question, session, tokenizer, llm_model)
         if not rewritten_question:
+            logger.info("answer.route clarification_after_rewrite session_id=%s resolved=%s", session_id, log_text(resolved_question))
             reply = translate_answer(build_clarification_reply(session), language)
             session["chat_history"].append({"role": "bot", "message": reply})
             return {
@@ -1785,6 +1986,14 @@ def answer_message(message, language="English", session_id=None):
         if intent == "general" and is_follow_up_question(rewritten_question):
             intent = session.get("current_intent", "general")
         topic = extract_topic_from_question(resolved_question) or session.get("current_topic", "")
+        logger.info(
+            "answer.rewrite.done session_id=%s rewritten=%s resolved=%s intent=%s topic=%s",
+            session_id,
+            log_text(rewritten_question),
+            log_text(resolved_question),
+            intent,
+            topic or "",
+        )
         suggested_questions = translate_suggested_questions(build_suggested_questions(topic, intent), language)
 
     search_query = build_intent_search_query(resolved_question, intent)
@@ -1812,12 +2021,16 @@ def answer_message(message, language="English", session_id=None):
     memory_context = ""
     recent_history = build_recent_chat_history(session)
     if exact_official_source:
+        logger.info("answer.route exact_official_source session_id=%s question=%s", session_id, log_text(exact_official_source.get("question", "")))
         reply = str(exact_official_source.get("answer", "")).strip()
     else:
+        logger.info("answer.route llm_rag session_id=%s topic=%s intent=%s sources=%s", session_id, topic or "", intent, [log_text(source.get("question", "")) for source in sources[:3]])
         reply = generate_llm_answer(message, banking_context, memory_context, recent_history, reranker_model, tokenizer, llm_model, language, intent, search_query, topic)
     reply = translate_answer(reply, language)
 
     remember_conversation_context(session, topic, intent, resolved_question)
+    if sources:
+        remember_kb_source_context(session, sources[0])
     session["chat_history"].append({"role": "bot", "message": reply})
     used_search_methods = sorted({
         method
