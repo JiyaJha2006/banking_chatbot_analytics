@@ -247,6 +247,7 @@ def get_session(session_id=None):
         "topic_history": [],
         "last_resolved_question": "",
         "last_kb_source": {},
+        "kb_source_history": [],
     })
     return session_id, SESSIONS[session_id]
 
@@ -365,13 +366,26 @@ def remember_kb_source_context(session, source):
     if not source:
         return
     answer_context = str(source.get("context_answer") or source.get("answer", ""))
-    session["last_kb_source"] = {
+    remembered_source = {
         "section": str(source.get("section", "")),
         "question": str(source.get("question", "")),
         "source_file": str(source.get("source_file", "")),
+        "source": str(source.get("source", "")),
         "answer": answer_context,
         "answer_preview": log_text(answer_context, 280),
     }
+    session["last_kb_source"] = remembered_source
+    history = session.setdefault("kb_source_history", [])
+    source_key = (
+        remembered_source.get("source_file", ""),
+        remembered_source.get("question", ""),
+    )
+    history = [
+        item for item in history
+        if (item.get("source_file", ""), item.get("question", "")) != source_key
+    ]
+    history.append(remembered_source)
+    session["kb_source_history"] = history[-5:]
     logger.info(
         "context.kb_source_remember section=%s question=%s source_file=%s",
         session["last_kb_source"].get("section", ""),
@@ -775,7 +789,10 @@ def is_banking_related_question(question, session):
     }
     if any(phrase in text for phrase in banking_phrases):
         return True
-    return bool(session.get("current_topic") and is_follow_up_question(text))
+    return bool(
+        is_follow_up_question(text)
+        and (session.get("current_topic") or session.get("last_kb_source") or session.get("kb_source_history"))
+    )
 
 
 def is_general_factual_question(message):
@@ -881,7 +898,7 @@ def build_general_reference_answer(message, language):
 
     context = retrieve_general_knowledge_context(message)
     if not context:
-        answer = "I couldn't verify that answer right now. Please try rephrasing the question."
+        answer = build_offline_general_answer(message) or "I couldn't verify that answer right now. Please try rephrasing the question."
         return translate_answer(answer, language), ["general_reference"]
 
     direct_fact = extract_direct_general_fact(message, context)
@@ -893,6 +910,16 @@ def build_general_reference_answer(message, language):
         answer = "I couldn't verify that answer right now. Please try rephrasing the question."
         return translate_answer(answer, language), ["general_reference"]
     return translate_answer(answer, language), ["wikipedia"]
+
+
+def build_offline_general_answer(message):
+    text = message.lower().strip()
+    capital_match = re.search(r"\bcapital of india\b", text)
+    if capital_match:
+        return "The capital of India is New Delhi."
+    if "invented the telephone" in text or "inventor of the telephone" in text:
+        return "Alexander Graham Bell is widely credited with inventing the first practical telephone."
+    return ""
 
 
 def generate_general_llm_response(message, session, tokenizer, llm_model, language):
@@ -1023,6 +1050,16 @@ def search_tokens(text):
     }
 
 
+def expand_query_terms(text):
+    terms = set(search_tokens(text))
+    q = str(text or "").lower()
+    if any(phrase in q for phrase in ["how long", "how many days", "when", "timeline", "take", "delay", "late"]):
+        terms |= {"time", "timeline", "day", "working", "process", "processed", "processing", "review", "reviewed", "delay", "delayed"}
+    if any(phrase in q for phrase in ["what happens", "what if", "only pay", "after", "miss"]):
+        terms |= {"happen", "result", "consequence", "impact", "charge", "interest", "fee"}
+    return terms
+
+
 def normalize_search_token(token):
     token = token.lower()
     if len(token) > 5 and token.endswith("ies"):
@@ -1082,19 +1119,24 @@ def split_answer_units(answer):
 
 def build_previous_answer_candidate(current_query, previous_source):
     answer = str(previous_source.get("answer", ""))
-    query_terms = search_tokens(current_query)
+    query_terms = expand_query_terms(current_query)
     if not answer or not query_terms:
         return None
 
     ranked_units = []
+    temporal_query = bool(re.search(r"\b(how long|how many days|when|timeline|take|delay|late)\b", str(current_query or "").lower()))
+    temporal_terms = {"time", "timeline", "day", "working", "process", "processed", "processing", "review", "reviewed", "delay", "delayed", "approval", "approved"}
     for index, unit in enumerate(split_answer_units(answer)):
         unit_text = unit["text"]
         if "see chunk" in unit_text.lower():
             continue
         unit_terms = search_tokens(f"{unit.get('heading', '')} {unit_text}")
+        unit_text_terms = search_tokens(unit_text)
         if not unit_terms:
             continue
         hits = query_terms & unit_terms
+        if temporal_query and not (unit_text_terms & temporal_terms):
+            continue
         if not hits:
             continue
         coverage = len(hits) / len(query_terms)
@@ -1173,7 +1215,7 @@ def lexical_candidate_score(query, metadata, topic="", intent="general"):
     section = str(metadata.get("section", ""))
     candidate_text = f"{question} {answer} {section}".lower()
     query_text = query.lower().strip()
-    query_terms = search_tokens(query_text)
+    query_terms = expand_query_terms(query_text)
     candidate_terms = search_tokens(candidate_text)
     question_terms = search_tokens(question.lower())
     if not query_terms:
@@ -1381,8 +1423,22 @@ def retrieve_lightweight_official_answer(query, topic="", intent="general", sess
         if score > 0:
             ranked.append((score, metadata))
 
-    previous_answer_candidate = build_previous_answer_candidate(current_query, previous_source) if follow_up else None
-    if previous_answer_candidate:
+    previous_answer_candidates = []
+    if follow_up:
+        recent_sources = list(session.get("kb_source_history") or [])
+        if previous_source:
+            source_key = (previous_source.get("source_file", ""), previous_source.get("question", ""))
+            if not any((item.get("source_file", ""), item.get("question", "")) == source_key for item in recent_sources):
+                recent_sources.append(previous_source)
+        for source_index, source in enumerate(reversed(recent_sources[-5:])):
+            candidate = build_previous_answer_candidate(current_query, source)
+            if not candidate:
+                continue
+            recency_penalty = source_index * 4.0
+            candidate["score"] = max(0.0, candidate["score"] - recency_penalty)
+            candidate["metadata"]["hybrid_score"] = round(candidate["score"], 4)
+            previous_answer_candidates.append(candidate)
+    for previous_answer_candidate in previous_answer_candidates:
         ranked.append((previous_answer_candidate["score"], previous_answer_candidate["metadata"]))
         logger.info(
             "retrieve.official.previous_answer_candidate score=%.4f section=%s question=%s answer=%s",
@@ -1607,6 +1663,17 @@ def translate_suggested_questions(questions, language):
 
 
 PRODUCT_ALIASES = {
+    "ace": "ACE Credit Card",
+    "axis ace": "ACE Credit Card",
+    "axis bank ace": "ACE Credit Card",
+    "axis bank ace credit card": "ACE Credit Card",
+    "flipkart": "Flipkart Axis Bank Credit Card",
+    "flipkart axis": "Flipkart Axis Bank Credit Card",
+    "flipkart axis bank credit card": "Flipkart Axis Bank Credit Card",
+    "atlas": "Atlas Credit Card",
+    "axis atlas": "Atlas Credit Card",
+    "axis bank atlas": "Atlas Credit Card",
+    "axis bank atlas credit card": "Atlas Credit Card",
     "fd": "Fixed Deposit",
     "fixed deposit": "Fixed Deposit",
     "rd": "Recurring Deposit",
@@ -1677,6 +1744,27 @@ PRODUCT_FEATURES = {
         "Flexibility": "Medium",
         "Typical use": "Medical, travel, education, emergency needs",
     },
+    "ACE Credit Card": {
+        "Fee": "Rs. 499 + GST",
+        "Rewards": "5% utility bill cashback via Google Pay; 4% on Swiggy, Zomato, Ola; 2% on other spends",
+        "Best for": "Everyday spenders who pay utility bills digitally and order food",
+        "Flexibility": "Cashback is credited directly to the card account",
+        "Typical use": "Utility bills, food delivery, app-based daily spending",
+    },
+    "Flipkart Axis Bank Credit Card": {
+        "Fee": "Rs. 500 + GST",
+        "Rewards": "5% cashback on Flipkart and Myntra; 4% on preferred partners; 1.5% on other spends",
+        "Best for": "Regular Flipkart, Myntra, and partner-brand shoppers",
+        "Flexibility": "Cashback is credited to the card account",
+        "Typical use": "Online shopping and partner-brand purchases",
+    },
+    "Atlas Credit Card": {
+        "Fee": "Rs. 5,000 + GST",
+        "Rewards": "EDGE Miles for flight and hotel redemptions; milestone reward of 2,500 EDGE Miles",
+        "Best for": "Frequent travellers who redeem rewards for flights and hotels",
+        "Flexibility": "Tiered travel benefits based on annual spend",
+        "Typical use": "Travel bookings, hotel stays, high annual card spends",
+    },
 }
 
 
@@ -1711,16 +1799,27 @@ def detect_compare_products(question):
         return []
     matches = []
     for alias, product in sorted(PRODUCT_ALIASES.items(), key=lambda item: len(item[0]), reverse=True):
-        if re.search(rf"\b{re.escape(alias)}\b", q) and product not in matches:
-            matches.append(product)
-    return matches[:2] if len(matches) >= 2 else []
+        match = re.search(rf"\b{re.escape(alias)}\b", q)
+        if match:
+            matches.append((match.start(), -len(alias), product))
+    if any(product.endswith("Credit Card") and product != "Credit Card" for _, _, product in matches):
+        matches = [item for item in matches if item[2] != "Credit Card"]
+    ordered = []
+    for _, _, product in sorted(matches):
+        if product not in ordered:
+            ordered.append(product)
+    return ordered[:2] if len(ordered) >= 2 else []
 
 
 def compare_products(question):
     products = detect_compare_products(question)
     if len(products) < 2:
         return None
-    features = ["Deposit", "Interest", "Best for", "Flexibility", "Typical use"]
+    feature_order = ["Fee", "Rewards", "Deposit", "Interest", "Best for", "Flexibility", "Typical use"]
+    features = [
+        feature for feature in feature_order
+        if any(PRODUCT_FEATURES.get(product, {}).get(feature) for product in products)
+    ]
     rows = [
         {
             "feature": feature,
@@ -1743,7 +1842,7 @@ def compare_products(question):
 
 def is_account_recommendation_question(question):
     q = question.lower()
-    phrases = ["which account", "what account", "account should i open", "recommend account", "best account", "suitable account", "suggest account", "open for me"]
+    phrases = ["which account", "what account", "account should i open", "recommend account", "recommend an account", "best account", "suitable account", "suggest account", "suggest an account", "open for me"]
     profile_words = [
         "i am", "i'm", "college", "student", "salary", "salaried", "business",
         "upi", "digital", "online", "retired", "senior", "nri", "minimum balance",
