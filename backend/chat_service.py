@@ -361,11 +361,13 @@ def remember_conversation_context(session, topic="", intent="general", resolved_
 def remember_kb_source_context(session, source):
     if not source:
         return
+    answer_context = str(source.get("context_answer") or source.get("answer", ""))
     session["last_kb_source"] = {
         "section": str(source.get("section", "")),
         "question": str(source.get("question", "")),
         "source_file": str(source.get("source_file", "")),
-        "answer_preview": log_text(source.get("answer", ""), 280),
+        "answer": answer_context,
+        "answer_preview": log_text(answer_context, 280),
     }
     logger.info(
         "context.kb_source_remember section=%s question=%s source_file=%s",
@@ -1009,11 +1011,129 @@ def search_tokens(text):
         "and", "or", "in", "on", "at", "with", "my", "me", "i", "you", "your",
         "please", "tell", "about", "can", "could", "would", "do", "does",
         "how", "what", "which", "who", "when", "where", "why", "if", "it",
-        "this", "that", "these", "those",
+        "this", "that", "these", "those", "will", "should", "shall", "must",
     }
     return {
-        token for token in re.findall(r"[a-z0-9]+", text.lower())
+        normalize_search_token(token)
+        for token in re.findall(r"[a-z0-9]+", text.lower())
         if len(token) > 1 and token not in stopwords
+    }
+
+
+def normalize_search_token(token):
+    token = token.lower()
+    if len(token) > 5 and token.endswith("ies"):
+        return f"{token[:-3]}y"
+    if len(token) > 5 and token.endswith("ing"):
+        return token[:-3]
+    if len(token) > 4 and token.endswith("ed"):
+        return token[:-2]
+    if len(token) > 4 and token.endswith("s") and not token.endswith("ss"):
+        return token[:-1]
+    return token
+
+
+def split_answer_units(answer):
+    units = []
+    heading = ""
+    paragraph = []
+    table = []
+
+    def flush_paragraph():
+        nonlocal paragraph
+        if paragraph:
+            units.append({"heading": heading, "text": " ".join(paragraph).strip()})
+            paragraph = []
+
+    def flush_table():
+        nonlocal table
+        if table:
+            units.append({"heading": heading, "text": "\n".join(table).strip()})
+            table = []
+
+    for raw_line in str(answer or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            flush_paragraph()
+            flush_table()
+            continue
+        if line.startswith("|") and line.endswith("|"):
+            flush_paragraph()
+            table.append(line)
+            continue
+        flush_table()
+        if re.match(r"^(#{1,6}\s+|\*\*[^*]+:\*\*\s*$)", line):
+            flush_paragraph()
+            heading = line
+            continue
+        if re.match(r"^([-*]\s+|\d+\.\s+)", line):
+            flush_paragraph()
+            units.append({"heading": heading, "text": line})
+            continue
+        paragraph.append(line)
+
+    flush_paragraph()
+    flush_table()
+    return [unit for unit in units if unit["text"]]
+
+
+def build_previous_answer_candidate(current_query, previous_source):
+    answer = str(previous_source.get("answer", ""))
+    query_terms = search_tokens(current_query)
+    if not answer or len(query_terms) < 2:
+        return None
+
+    ranked_units = []
+    for index, unit in enumerate(split_answer_units(answer)):
+        unit_text = unit["text"]
+        if "see chunk" in unit_text.lower():
+            continue
+        unit_terms = search_tokens(f"{unit.get('heading', '')} {unit_text}")
+        if not unit_terms:
+            continue
+        hits = query_terms & unit_terms
+        if not hits:
+            continue
+        coverage = len(hits) / len(query_terms)
+        density = len(hits) / max(len(unit_terms), 1)
+        order_bonus = max(0.0, 1.0 - index * 0.03)
+        score = coverage * 30.0 + density * 12.0 + len(hits) * 2.5 + order_bonus
+        ranked_units.append((score, index, unit))
+
+    if not ranked_units:
+        return None
+    ranked_units.sort(key=lambda item: item[0], reverse=True)
+    best_score = ranked_units[0][0]
+    if best_score < 14.0:
+        return None
+
+    selected_indexes = sorted(index for _, index, _ in ranked_units[:4])
+    selected = [split_answer_units(answer)[index] for index in selected_indexes]
+    lines = []
+    last_heading = None
+    for unit in selected:
+        heading = unit.get("heading", "")
+        if heading and heading != last_heading:
+            lines.append(heading)
+            last_heading = heading
+        lines.append(unit["text"])
+    snippet = "\n".join(lines).strip()
+    if not snippet:
+        return None
+
+    return {
+        "score": round(best_score + 45.0, 4),
+        "metadata": {
+            "section": previous_source.get("section", ""),
+            "question": previous_source.get("question", ""),
+            "answer": snippet,
+            "context_answer": answer,
+            "source": previous_source.get("source", "Official knowledge base"),
+            "source_file": previous_source.get("source_file", ""),
+            "dataset": "official_kb",
+            "search_methods": ["official_kb", "previous_answer_context"],
+            "hybrid_score": round(best_score + 45.0, 4),
+        },
     }
 
 
@@ -1055,31 +1175,28 @@ def lexical_candidate_score(query, metadata, topic="", intent="general"):
     if not query_terms:
         return 0.0
     overlap = len(query_terms & candidate_terms) / len(query_terms)
-    question_overlap = len(query_terms & question_terms) / len(query_terms)
+    question_hits = query_terms & question_terms
+    question_overlap = len(question_hits) / len(query_terms)
     question_ratio = SequenceMatcher(None, query_text, question.lower()).ratio()
     phrase_bonus = 5.0 if query_text and query_text in candidate_text else 0.0
     exact_bonus = 100.0 if normalize_match_text(query_text) == normalize_match_text(question) else 0.0
     topic_bonus = score_topic_match(topic, candidate_text)
     intent_bonus = score_intent_match(intent, candidate_text)
     query_bonus = score_query_specific_match(query_text, question.lower(), candidate_text)
-    return exact_bonus + overlap * 7.0 + question_overlap * 8.0 + question_ratio * 3.0 + phrase_bonus + topic_bonus + intent_bonus + query_bonus
+    return exact_bonus + overlap * 7.0 + question_overlap * 18.0 + len(question_hits) * 4.0 + question_ratio * 3.0 + phrase_bonus + topic_bonus + intent_bonus + query_bonus
 
 
 def score_query_specific_match(query_text, question_text, candidate_text):
-    score = 0.0
-    if "file" in query_text and "dispute" in query_text:
-        if "file a dispute" in question_text:
-            score += 30.0
-        elif "file a dispute" in candidate_text:
-            score += 5.0
-        if "chargeback" in candidate_text or "transaction dispute" in candidate_text:
-            score += 8.0
-    if any(word in query_text for word in ["complaint", "complain", "ombudsman", "escalate", "escalation"]):
-        if any(phrase in question_text for phrase in ["right to complain", "complaint", "ombudsman", "escalate"]):
-            score += 35.0
-        if any(phrase in candidate_text for phrase in ["rbi ombudsman", "complaint", "grievance", "escalate"]):
-            score += 10.0
-    return score
+    query_terms = search_tokens(query_text)
+    question_terms = search_tokens(question_text)
+    candidate_terms = search_tokens(candidate_text)
+    if not query_terms:
+        return 0.0
+    title_hits = query_terms & question_terms
+    body_hits = query_terms & candidate_terms
+    title_coverage = len(title_hits) / len(query_terms)
+    body_coverage = len(body_hits) / len(query_terms)
+    return title_coverage * 10.0 + body_coverage * 3.0
 
 
 def retrieve_hybrid_banking_context(
@@ -1237,9 +1354,9 @@ def retrieve_lightweight_official_answer(query, topic="", intent="general", sess
         score = lexical_candidate_score(current_query, metadata, topic, intent)
         if follow_up:
             if query != current_query:
-                score += lexical_candidate_score(query, metadata, topic, intent) * 0.20
+                score += lexical_candidate_score(query, metadata, topic, intent) * 0.05
             if contextual_query not in {query, current_query}:
-                score += lexical_candidate_score(contextual_query, metadata, topic, intent) * 0.15
+                score += lexical_candidate_score(contextual_query, metadata, topic, intent) * 0.05
             question_terms = search_tokens(metadata.get("question", ""))
             direct_title_hits = query_terms & question_terms
             if direct_title_hits:
@@ -1259,6 +1376,17 @@ def retrieve_lightweight_official_answer(query, topic="", intent="general", sess
             score += 75.0
         if score > 0:
             ranked.append((score, metadata))
+
+    previous_answer_candidate = build_previous_answer_candidate(current_query, previous_source) if follow_up else None
+    if previous_answer_candidate:
+        ranked.append((previous_answer_candidate["score"], previous_answer_candidate["metadata"]))
+        logger.info(
+            "retrieve.official.previous_answer_candidate score=%.4f section=%s question=%s answer=%s",
+            previous_answer_candidate["score"],
+            previous_answer_candidate["metadata"].get("section", ""),
+            log_text(previous_answer_candidate["metadata"].get("question", "")),
+            log_text(previous_answer_candidate["metadata"].get("answer", "")),
+        )
     ranked.sort(key=lambda item: item[0], reverse=True)
     for rank, (score, metadata) in enumerate(ranked[:5], 1):
         logger.info(
@@ -1278,10 +1406,13 @@ def retrieve_lightweight_official_answer(query, topic="", intent="general", sess
         )
 
     score, metadata = ranked[0]
-    methods = ["official_kb", "lexical"]
-    if normalize_match_text(current_query) == normalize_match_text(metadata.get("question", "")):
+    methods = list(metadata.get("search_methods") or ["official_kb", "lexical"])
+    if normalize_match_text(current_query) == normalize_match_text(metadata.get("question", "")) and "exact" not in methods:
         methods.append("exact")
-    elif SequenceMatcher(None, normalize_match_text(current_query), normalize_match_text(metadata.get("question", ""))).ratio() >= 0.72:
+    elif (
+        SequenceMatcher(None, normalize_match_text(current_query), normalize_match_text(metadata.get("question", ""))).ratio() >= 0.72
+        and "fuzzy" not in methods
+    ):
         methods.append("fuzzy")
     source = {
         **metadata,
@@ -1904,8 +2035,6 @@ def answer_message(message, language="English", session_id=None):
         reply = build_form_assistant_answer(topic, intent, search_question)
         reply = translate_answer(reply, language)
         remember_conversation_context(session, topic, intent, resolved_question)
-        if sources:
-            remember_kb_source_context(session, sources[0])
         session["chat_history"].append({"role": "bot", "message": reply})
         return {
             "session_id": session_id,
