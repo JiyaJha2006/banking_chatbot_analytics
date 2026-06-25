@@ -84,7 +84,10 @@ BANKING_VOCABULARY = set(
     "transfer", "withdrawal", "apply", "open", "activate", "documents",
     "required", "salaried", "self-employed", "compare", "benefits", "fees",
     "charges", "steps", "chargeback", "unauthorized", "unauthorised",
-    "suspicious", "ombudsman", "escalate", "escalation",
+    "suspicious", "ombudsman", "escalate", "escalation", "reward", "rewards",
+    "points", "edge", "redeem", "redemption", "cashback", "bill", "billing",
+    "due", "emi", "approval", "approved", "consent", "liability", "rbi",
+    "annual", "joining", "limit", "limits", "cardholder",
 }
 
 QUERY_WORDS = {
@@ -1080,7 +1083,7 @@ def split_answer_units(answer):
 def build_previous_answer_candidate(current_query, previous_source):
     answer = str(previous_source.get("answer", ""))
     query_terms = search_tokens(current_query)
-    if not answer or len(query_terms) < 2:
+    if not answer or not query_terms:
         return None
 
     ranked_units = []
@@ -1104,7 +1107,7 @@ def build_previous_answer_candidate(current_query, previous_source):
         return None
     ranked_units.sort(key=lambda item: item[0], reverse=True)
     best_score = ranked_units[0][0]
-    if best_score < 14.0:
+    if best_score < 9.0:
         return None
 
     selected_indexes = sorted(index for _, index, _ in ranked_units[:4])
@@ -1121,8 +1124,9 @@ def build_previous_answer_candidate(current_query, previous_source):
     if not snippet:
         return None
 
+    context_bonus = 20.0 if len(query_terms) == 1 else 45.0
     return {
-        "score": round(best_score + 45.0, 4),
+        "score": round(best_score + context_bonus, 4),
         "metadata": {
             "section": previous_source.get("section", ""),
             "question": previous_source.get("question", ""),
@@ -1132,7 +1136,7 @@ def build_previous_answer_candidate(current_query, previous_source):
             "source_file": previous_source.get("source_file", ""),
             "dataset": "official_kb",
             "search_methods": ["official_kb", "previous_answer_context"],
-            "hybrid_score": round(best_score + 45.0, 4),
+            "hybrid_score": round(best_score + context_bonus, 4),
         },
     }
 
@@ -1998,6 +2002,27 @@ def answer_message(message, language="English", session_id=None):
             "topic": comparison["topic"],
         }
 
+    if is_account_recommendation_question(search_question):
+        logger.info("answer.route recommendation session_id=%s question=%s", session_id, log_text(search_question))
+        reply, recommendation_card = recommend_account(search_question)
+        reply = translate_answer(reply, language)
+        recommendation_topic = recommendation_card.get("account", "account recommendation")
+        remember_conversation_context(session, recommendation_topic, "recommendation", search_question)
+        session["chat_history"].append({"role": "bot", "message": reply})
+        return {
+            "session_id": session_id,
+            "reply": reply,
+            "history": session["chat_history"],
+            "sources": [],
+            "suggested_questions": translate_suggested_questions([
+                "How do I open the recommended account?",
+                "Which documents are needed for the recommended account?",
+                "What benefits does the recommended account offer?",
+            ], language),
+            "recommendation_card": recommendation_card,
+            "topic": recommendation_topic,
+        }
+
     pending_reply = handle_pending_flow(search_question, session)
     if pending_reply:
         logger.info("answer.route pending_flow session_id=%s response_topic=%s intent=%s", session_id, pending_flow_topic or topic, intent)
@@ -2013,6 +2038,43 @@ def answer_message(message, language="English", session_id=None):
             "sources": [],
             "suggested_questions": response_suggestions,
             "topic": response_topic,
+        }
+
+    banking_related = is_banking_related_question(search_question, session)
+
+    if LIGHTWEIGHT_MODE and banking_related:
+        logger.info("answer.route lightweight_official session_id=%s topic=%s intent=%s resolved=%s", session_id, topic or "", intent, log_text(resolved_question))
+        reply, sources = retrieve_lightweight_official_answer(
+            resolved_question,
+            topic,
+            intent,
+            session=session,
+            follow_up=is_follow_up_question(search_question) or bool(session.get("last_kb_source") and topic == session.get("current_topic")),
+            current_query=search_question,
+        )
+        reply = translate_answer(reply, language)
+        remember_conversation_context(session, topic, intent, resolved_question)
+        if sources:
+            remember_kb_source_context(session, sources[0])
+        response_suggestions = translate_suggested_questions(
+            build_contextual_suggested_questions(sources[0] if sources else None, topic, intent),
+            language,
+        )
+        session["chat_history"].append({"role": "bot", "message": reply})
+        return {
+            "session_id": session_id,
+            "reply": reply,
+            "history": session["chat_history"],
+            "sources": sources[:3],
+            "suggested_questions": response_suggestions,
+            "recommendation_card": None,
+            "topic": topic,
+            "rewritten_question": None,
+            "search_methods": sorted({
+                method
+                for source in sources
+                for method in source.get("search_methods", [])
+            } | {"lightweight_official_kb"}),
         }
 
     clarifying_reply = build_clarifying_question(search_question, topic, intent, session)
@@ -2045,28 +2107,7 @@ def answer_message(message, language="English", session_id=None):
             "topic": topic,
         }
 
-    if is_account_recommendation_question(search_question):
-        logger.info("answer.route recommendation session_id=%s question=%s", session_id, log_text(search_question))
-        reply, recommendation_card = recommend_account(search_question)
-        reply = translate_answer(reply, language)
-        recommendation_topic = recommendation_card.get("account", "account recommendation")
-        remember_conversation_context(session, recommendation_topic, "recommendation", search_question)
-        session["chat_history"].append({"role": "bot", "message": reply})
-        return {
-            "session_id": session_id,
-            "reply": reply,
-            "history": session["chat_history"],
-            "sources": [],
-            "suggested_questions": translate_suggested_questions([
-                "How do I open the recommended account?",
-                "Which documents are needed for the recommended account?",
-                "What benefits does the recommended account offer?",
-            ], language),
-            "recommendation_card": recommendation_card,
-            "topic": recommendation_topic,
-        }
-
-    if not is_banking_related_question(search_question, session):
+    if not banking_related:
         if LIGHTWEIGHT_MODE:
             logger.info("answer.route lightweight_general session_id=%s question=%s", session_id, log_text(message))
             reply, general_methods = build_general_reference_answer(message, language)
