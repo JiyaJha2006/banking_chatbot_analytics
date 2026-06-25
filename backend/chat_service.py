@@ -288,12 +288,30 @@ def build_search_query(user_question, session):
 def resolve_question_context(user_question, session):
     current_topic = str(session.get("current_topic", "")).strip()
     explicit_topic = extract_topic_from_question(user_question)
-    if explicit_topic or not current_topic or not is_follow_up_question(user_question):
+    follow_up = is_follow_up_question(user_question)
+    previous_source = session.get("last_kb_source") or {}
+    if follow_up and not explicit_topic and previous_source:
+        source_context = " ".join([
+            previous_source.get("section", ""),
+            previous_source.get("question", ""),
+        ]).strip()
+        if source_context:
+            resolved = " ".join(f"{user_question} about {source_context}".split())
+            logger.info(
+                "context.resolve follow_up_kb_source original=%s resolved=%s previous_section=%s previous_question=%s",
+                log_text(user_question),
+                log_text(resolved),
+                previous_source.get("section", ""),
+                log_text(previous_source.get("question", "")),
+            )
+            return resolved
+
+    if explicit_topic or not current_topic or not follow_up:
         logger.info(
             "context.resolve passthrough explicit_topic=%s current_topic=%s follow_up=%s question=%s",
             explicit_topic or "",
             current_topic or "",
-            is_follow_up_question(user_question),
+            follow_up,
             log_text(user_question),
         )
         return user_question
@@ -364,7 +382,6 @@ def build_contextual_retrieval_query(query, session):
     context_text = " ".join([
         source.get("section", ""),
         source.get("question", ""),
-        source.get("answer_preview", ""),
     ]).strip()
     if not context_text:
         return query
@@ -991,6 +1008,8 @@ def search_tokens(text):
         "a", "an", "the", "is", "are", "was", "were", "be", "to", "of", "for",
         "and", "or", "in", "on", "at", "with", "my", "me", "i", "you", "your",
         "please", "tell", "about", "can", "could", "would", "do", "does",
+        "how", "what", "which", "who", "when", "where", "why", "if", "it",
+        "this", "that", "these", "those",
     }
     return {
         token for token in re.findall(r"[a-z0-9]+", text.lower())
@@ -1193,15 +1212,18 @@ def retrieve_lightweight_banking_answer(query, topic, intent, banking_collection
     return str(metadata.get("answer", "")).strip(), [source]
 
 
-def retrieve_lightweight_official_answer(query, topic="", intent="general", session=None, follow_up=False):
+def retrieve_lightweight_official_answer(query, topic="", intent="general", session=None, follow_up=False, current_query=None):
     documents = load_official_kb_documents()
     ranked = []
     session = session or {}
+    current_query = current_query or query
     previous_source = session.get("last_kb_source") or {}
-    contextual_query = build_contextual_retrieval_query(query, session) if follow_up else query
+    contextual_query = build_contextual_retrieval_query(current_query, session) if follow_up else current_query
+    query_terms = search_tokens(current_query)
     logger.info(
-        "retrieve.official.start query=%s contextual_query=%s topic=%s intent=%s follow_up=%s documents=%s previous_section=%s previous_question=%s previous_source_file=%s",
+        "retrieve.official.start query=%s current_query=%s contextual_query=%s topic=%s intent=%s follow_up=%s documents=%s previous_section=%s previous_question=%s previous_source_file=%s",
         log_text(query),
+        log_text(current_query),
         log_text(contextual_query),
         topic or "",
         intent,
@@ -1212,14 +1234,28 @@ def retrieve_lightweight_official_answer(query, topic="", intent="general", sess
         previous_source.get("source_file", ""),
     )
     for metadata in documents:
-        score = lexical_candidate_score(query, metadata, topic, intent)
-        if follow_up and contextual_query != query:
-            score += lexical_candidate_score(contextual_query, metadata, topic, intent) * 0.35
+        score = lexical_candidate_score(current_query, metadata, topic, intent)
+        if follow_up:
+            if query != current_query:
+                score += lexical_candidate_score(query, metadata, topic, intent) * 0.20
+            if contextual_query not in {query, current_query}:
+                score += lexical_candidate_score(contextual_query, metadata, topic, intent) * 0.15
+            question_terms = search_tokens(metadata.get("question", ""))
+            direct_title_hits = query_terms & question_terms
+            if direct_title_hits:
+                score += len(direct_title_hits) * 8.0
             if previous_source.get("source_file") and metadata.get("source_file") == previous_source.get("source_file"):
                 score += 4.0
             elif previous_source.get("section") and metadata.get("section") == previous_source.get("section"):
                 score += 2.0
-        if normalize_match_text(query) == normalize_match_text(metadata.get("question", "")):
+            if (
+                previous_source.get("question")
+                and normalize_match_text(previous_source.get("question", "")) == normalize_match_text(metadata.get("question", ""))
+                and normalize_match_text(current_query) != normalize_match_text(metadata.get("question", ""))
+                and not direct_title_hits
+            ):
+                score -= 18.0
+        if normalize_match_text(current_query) == normalize_match_text(metadata.get("question", "")):
             score += 75.0
         if score > 0:
             ranked.append((score, metadata))
@@ -1243,9 +1279,9 @@ def retrieve_lightweight_official_answer(query, topic="", intent="general", sess
 
     score, metadata = ranked[0]
     methods = ["official_kb", "lexical"]
-    if normalize_match_text(query) == normalize_match_text(metadata.get("question", "")):
+    if normalize_match_text(current_query) == normalize_match_text(metadata.get("question", "")):
         methods.append("exact")
-    elif SequenceMatcher(None, normalize_match_text(query), normalize_match_text(metadata.get("question", ""))).ratio() >= 0.72:
+    elif SequenceMatcher(None, normalize_match_text(current_query), normalize_match_text(metadata.get("question", ""))).ratio() >= 0.72:
         methods.append("fuzzy")
     source = {
         **metadata,
@@ -1952,6 +1988,7 @@ def answer_message(message, language="English", session_id=None):
             intent,
             session=session,
             follow_up=is_follow_up_question(search_question) or bool(session.get("last_kb_source") and topic == session.get("current_topic")),
+            current_query=search_question,
         )
         reply = translate_answer(reply, language)
         remember_conversation_context(session, topic, intent, resolved_question)
