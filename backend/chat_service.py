@@ -473,6 +473,46 @@ def build_suggested_questions(topic="", intent="general"):
     return ["What is a savings account?", "What is FD?", "How to activate net banking?"]
 
 
+def build_contextual_suggested_questions(source=None, topic="", intent="general"):
+    if source:
+        current_question = normalize_match_text(source.get("question", ""))
+        source_file = source.get("source_file", "")
+        section = source.get("section", "")
+        candidates = []
+        for item in load_official_kb_documents():
+            question = item.get("question", "")
+            if not question or normalize_match_text(question) == current_question:
+                continue
+            score = 0
+            if source_file and item.get("source_file") == source_file:
+                score += 8
+            if section and item.get("section") == section:
+                score += 5
+            score += score_intent_match(intent, f"{item.get('question', '')} {item.get('answer', '')} {item.get('section', '')}")
+            score += score_query_specific_match(
+                f"{source.get('question', '')} {source.get('answer', '')}",
+                item.get("question", "").lower(),
+                f"{item.get('question', '')} {item.get('answer', '')} {item.get('section', '')}".lower(),
+            )
+            if score > 0:
+                candidates.append((score, question))
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        suggestions = []
+        for _, question in candidates:
+            if question not in suggestions:
+                suggestions.append(question)
+            if len(suggestions) == 3:
+                logger.info(
+                    "suggestions.contextual source_question=%s suggestions=%s",
+                    log_text(source.get("question", "")),
+                    suggestions,
+                )
+                return suggestions
+    suggestions = build_suggested_questions(topic, intent)
+    logger.info("suggestions.fallback topic=%s intent=%s suggestions=%s", topic or "", intent, suggestions)
+    return suggestions
+
+
 def build_form_assistant_answer(topic, intent="general", user_profile=""):
     topic = normalize_topic_label(topic) or "this banking service"
     category = detect_product_category(topic)
@@ -1917,13 +1957,17 @@ def answer_message(message, language="English", session_id=None):
         remember_conversation_context(session, topic, intent, resolved_question)
         if sources:
             remember_kb_source_context(session, sources[0])
+        response_suggestions = translate_suggested_questions(
+            build_contextual_suggested_questions(sources[0] if sources else None, topic, intent),
+            language,
+        )
         session["chat_history"].append({"role": "bot", "message": reply})
         return {
             "session_id": session_id,
             "reply": reply,
             "history": session["chat_history"],
             "sources": sources[:3],
-            "suggested_questions": suggested_questions,
+            "suggested_questions": response_suggestions,
             "recommendation_card": None,
             "topic": topic,
             "rewritten_question": None,
@@ -2031,6 +2075,10 @@ def answer_message(message, language="English", session_id=None):
     remember_conversation_context(session, topic, intent, resolved_question)
     if sources:
         remember_kb_source_context(session, sources[0])
+    response_suggestions = translate_suggested_questions(
+        build_contextual_suggested_questions(sources[0] if sources else None, topic, intent),
+        language,
+    )
     session["chat_history"].append({"role": "bot", "message": reply})
     used_search_methods = sorted({
         method
@@ -2043,7 +2091,7 @@ def answer_message(message, language="English", session_id=None):
         "reply": reply,
         "history": session["chat_history"],
         "sources": sources[:3] if isinstance(sources, list) else [],
-        "suggested_questions": suggested_questions,
+        "suggested_questions": response_suggestions,
         "recommendation_card": recommendation_card,
         "topic": topic,
         "rewritten_question": rewritten_question or None,
