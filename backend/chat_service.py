@@ -248,6 +248,7 @@ def get_session(session_id=None):
         "topic_history": [],
         "last_resolved_question": "",
         "last_kb_source": {},
+        "last_entity_kb_source": {},
         "kb_source_history": [],
         "last_comparison": {},
     })
@@ -385,6 +386,8 @@ def remember_kb_source_context(session, source):
         "answer_preview": log_text(answer_context, 280),
     }
     session["last_kb_source"] = remembered_source
+    if source_entity_label(remembered_source):
+        session["last_entity_kb_source"] = remembered_source
     history = session.setdefault("kb_source_history", [])
     source_key = (
         remembered_source.get("source_file", ""),
@@ -1192,7 +1195,7 @@ def build_previous_answer_candidate(current_query, previous_source):
         return None
     ranked_units.sort(key=lambda item: item[0], reverse=True)
     best_score = ranked_units[0][0]
-    min_score = 4.0 if temporal_query else 9.0
+    min_score = 4.0 if temporal_query or is_product_attribute_followup(current_query) else 9.0
     if best_score < min_score:
         return None
 
@@ -1438,6 +1441,14 @@ def retrieve_lightweight_official_answer(query, topic="", intent="general", sess
     session = session or {}
     current_query = current_query or query
     previous_source = session.get("last_kb_source") or {}
+    entity_source = session.get("last_entity_kb_source") or {}
+    if (
+        follow_up
+        and entity_source
+        and is_product_attribute_followup(current_query)
+        and not question_mentions_product_entity(current_query)
+    ):
+        previous_source = entity_source
     contextual_query = build_contextual_retrieval_query(current_query, session) if follow_up else current_query
     query_terms = search_tokens(current_query)
     logger.info(
@@ -1492,6 +1503,8 @@ def retrieve_lightweight_official_answer(query, topic="", intent="general", sess
             if not candidate:
                 continue
             recency_penalty = source_index * 4.0
+            if entity_source and source.get("question") == entity_source.get("question") and is_product_attribute_followup(current_query):
+                recency_penalty -= 30.0
             candidate["score"] = max(0.0, candidate["score"] - recency_penalty)
             candidate["metadata"]["hybrid_score"] = round(candidate["score"], 4)
             previous_answer_candidates.append(candidate)
@@ -1895,6 +1908,31 @@ def compare_products(question):
         },
         "topic": f"{products[0]} vs {products[1]}",
     }
+
+
+def source_entity_label(source):
+    text = f"{source.get('question', '')} {source.get('answer_preview', '')}".lower()
+    for alias, product in sorted(PRODUCT_ALIASES.items(), key=lambda item: len(item[0]), reverse=True):
+        if product == "Credit Card":
+            continue
+        if product.endswith("Credit Card") and re.search(rf"\b{re.escape(alias)}\b", text):
+            return product
+    return ""
+
+
+def question_mentions_product_entity(question):
+    q = str(question or "").lower()
+    return bool(source_entity_label({"question": q, "answer_preview": ""}))
+
+
+def is_product_attribute_followup(question):
+    terms = expand_query_terms(question)
+    attribute_terms = {
+        "fee", "annual", "joining", "cashback", "reward", "rewards", "point",
+        "points", "mile", "miles", "best", "suitable", "use", "lounge",
+        "benefit", "benefits", "limit", "interest",
+    }
+    return bool(terms & attribute_terms) or is_pronoun_reference(question)
 
 
 def answer_comparison_followup(question, session):
