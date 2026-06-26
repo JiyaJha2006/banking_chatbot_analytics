@@ -22,7 +22,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data"
 DB_PATH = str(DATA_DIR / "vector_db")
 BANKING_COLLECTION_NAME = "banking_knowledge_base"
-MEMORY_COLLECTION_NAME = "chat_memory"
 SESSIONS = {}
 BANKING_METADATA_CACHE = {"count": -1, "metadatas": []}
 MODEL_BUNDLE = None
@@ -180,11 +179,7 @@ def get_ready_models():
 def load_vector_db():
     client = chromadb.PersistentClient(path=DB_PATH)
     banking_collection = client.get_or_create_collection(name=BANKING_COLLECTION_NAME)
-    banking_collection = ensure_official_banking_collection(client, banking_collection)
-    return (
-        banking_collection,
-        client.get_or_create_collection(name=MEMORY_COLLECTION_NAME),
-    )
+    return ensure_official_banking_collection(client, banking_collection)
 
 
 def collection_uses_official_kb(collection, expected_count):
@@ -289,18 +284,6 @@ def build_recent_chat_history(session):
         role = "User" if chat["role"] == "user" else "Assistant"
         text += f"{role}: {chat['message']}\n"
     return text
-
-
-def build_search_query(user_question, session):
-    q = user_question.lower().strip()
-    current_topic = str(session.get("current_topic", "")).strip()
-    if current_topic and is_follow_up_question(user_question):
-        rewritten = f" {user_question} "
-        for pronoun in ["it", "this", "that", "they", "them", "those", "these"]:
-            rewritten = rewritten.lower().replace(f" {pronoun} ", f" {current_topic} ")
-        rewritten = rewritten.strip()
-        return f"{user_question} about {current_topic}" if rewritten == q else rewritten
-    return user_question
 
 
 def resolve_question_context(user_question, session):
@@ -1032,25 +1015,6 @@ def build_clarification_reply(session):
     return "I could not clearly understand that banking question. Please mention the product or service, for example savings account, home loan, FD, card, UPI, or net banking."
 
 
-def retrieve_banking_context(search_query, embedding_model, banking_collection, top_k=40):
-    query_embedding = embedding_model.encode(search_query).tolist()
-    results = banking_collection.query(query_embeddings=[query_embedding], n_results=top_k)
-    documents = results.get("documents", [[]])[0]
-    metadatas = results.get("metadatas", [[]])[0]
-    distances = results.get("distances", [[]])[0]
-    context = ""
-    for i in range(len(documents)):
-        metadata = metadatas[i]
-        context += f"""
-Result {i + 1}:
-Section: {metadata.get('section', '')}
-Question: {metadata.get('question', '')}
-Answer: {metadata.get('answer', '')}
-Distance: {distances[i] if i < len(distances) else ''}
-"""
-    return context, metadatas, distances
-
-
 def search_tokens(text):
     stopwords = {
         "a", "an", "the", "is", "are", "was", "were", "be", "to", "of", "for",
@@ -1523,9 +1487,7 @@ def retrieve_lightweight_official_answer(query, topic="", intent="general", sess
         and is_product_attribute_followup(current_query)
         and not question_mentions_product_entity(current_query)
     )
-    if (
-        product_attribute_context
-    ):
+    if product_attribute_context:
         previous_source = entity_source
     contextual_query = build_contextual_retrieval_query(current_query, session) if (follow_up or product_attribute_context) else current_query
     query_terms = search_tokens(current_query)
@@ -1652,25 +1614,6 @@ def retrieve_lightweight_official_answer(query, topic="", intent="general", sess
         metadata.get("source_file", ""),
     )
     return str(metadata.get("answer", "")).strip(), [source]
-
-
-def retrieve_chat_memory(search_query, embedding_model, memory_collection, top_k=1):
-    if memory_collection.count() == 0:
-        return ""
-    query_embedding = embedding_model.encode(search_query).tolist()
-    results = memory_collection.query(query_embeddings=[query_embedding], n_results=top_k)
-    docs = results.get("documents", [[]])[0]
-    return "".join(f"\nPast Conversation {i + 1}:\n{doc}\n" for i, doc in enumerate(docs))
-
-
-def save_chat_memory(user_question, bot_answer, embedding_model, memory_collection):
-    memory_text = f"\nUser: {user_question}\nAssistant: {bot_answer}\n"
-    memory_collection.add(
-        ids=[str(uuid.uuid4())],
-        embeddings=[embedding_model.encode(memory_text).tolist()],
-        documents=[memory_text],
-        metadatas=[{"user_question": user_question, "bot_answer": bot_answer}],
-    )
 
 
 def score_intent_match(intent, candidate_text):
@@ -2542,7 +2485,7 @@ def answer_message(message, language="English", session_id=None):
             } | {"lightweight_official_kb"}),
         }
 
-    banking_collection, _ = load_vector_db()
+    banking_collection = load_vector_db()
     ready_models = get_ready_models()
     if ready_models is None:
         logger.info("answer.route chroma_lightweight_fallback session_id=%s topic=%s intent=%s", session_id, topic or "", intent)
