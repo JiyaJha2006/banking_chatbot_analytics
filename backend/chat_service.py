@@ -1179,6 +1179,49 @@ def split_answer_units(answer):
     return [unit for unit in units if unit["text"]]
 
 
+def looks_like_intro_unit(unit):
+    text = str(unit.get("text", "")).strip()
+    if not text:
+        return False
+    if text.startswith("|") or re.match(r"^([-*]\s+|\d+\.\s+)", text):
+        return False
+    words = re.findall(r"[a-z0-9]+", text.lower())
+    if len(words) > 28:
+        return False
+    return bool(re.search(r"(:$|\b(include|includes|offer|offers|provide|provides|following|below|steps|methods|options|ways)\b)", text, re.IGNORECASE))
+
+
+def expand_selected_answer_unit_indexes(units, ranked_units, selected_indexes):
+    expanded = set(selected_indexes)
+    if not units:
+        return []
+
+    for _, index, unit in ranked_units[:3]:
+        if index not in expanded:
+            continue
+        should_include_following = looks_like_intro_unit(unit) or len(search_tokens(unit.get("text", ""))) <= 5
+        if not should_include_following:
+            continue
+        for next_index in range(index + 1, min(len(units), index + 5)):
+            next_text = str(units[next_index].get("text", "")).strip()
+            if not next_text:
+                continue
+            expanded.add(next_index)
+            if len(expanded) >= 6:
+                break
+
+    if len(expanded) <= 2:
+        snippet_words = sum(len(re.findall(r"[a-z0-9]+", units[index].get("text", ""))) for index in expanded)
+        if snippet_words < 22:
+            first = min(expanded) if expanded else ranked_units[0][1]
+            for next_index in range(first + 1, min(len(units), first + 5)):
+                expanded.add(next_index)
+                if len(expanded) >= 5:
+                    break
+
+    return sorted(expanded)
+
+
 def build_previous_answer_candidate(current_query, previous_source):
     answer = str(previous_source.get("answer", ""))
     query_terms = expand_query_terms(current_query)
@@ -1191,7 +1234,8 @@ def build_previous_answer_candidate(current_query, previous_source):
     required_temporal_terms = expand_query_terms(current_query) & {"investigation", "approval", "closure", "complaint", "dispute", "chargeback"}
     action_followup = bool(re.search(r"\b(next|what should i do|what do i do)\b", str(current_query or "").lower()))
     action_terms = {"report", "call", "email", "visit", "file", "block", "contact", "request", "submit", "redeem"}
-    for index, unit in enumerate(split_answer_units(answer)):
+    units = split_answer_units(answer)
+    for index, unit in enumerate(units):
         unit_text = unit["text"]
         if "see chunk" in unit_text.lower():
             continue
@@ -1227,7 +1271,8 @@ def build_previous_answer_candidate(current_query, previous_source):
         return None
 
     selected_indexes = sorted(index for _, index, _ in ranked_units[:4])
-    selected = [split_answer_units(answer)[index] for index in selected_indexes]
+    selected_indexes = expand_selected_answer_unit_indexes(units, ranked_units, selected_indexes)
+    selected = [units[index] for index in selected_indexes]
     lines = []
     last_heading = None
     for unit in selected:
