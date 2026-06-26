@@ -263,7 +263,7 @@ def is_follow_up_question(user_question):
         "documents needed", "required documents", "explain more", "tell me more",
         "what about", "does it", "can it", "is it", "which is better",
         "better one", "how long", "what next", "then what", "what should i do next",
-        "where do i file", "file online", "how long should i wait",
+        "where do i file", "file online", "how long should i wait", "how many days",
     ]
     if any(re.search(rf"\b{re.escape(phrase)}\b", q) for phrase in phrases):
         return True
@@ -427,7 +427,7 @@ def detect_question_intent(question):
         ("documents", ["document", "documents", "proof", "kyc", "required", "requirement", "need to carry", "needed"]),
         ("fees", ["fee", "fees", "charge", "charges", "cost", "minimum balance", "penalty"]),
         ("interest", ["interest rate", "rate of interest", "returns", "interest earned", "how much interest"]),
-        ("tenure", ["how long", "tenure", "duration", "maturity period", "term period"]),
+        ("tenure", ["how long", "how many days", "tenure", "duration", "maturity period", "term period"]),
         ("limits", ["limit", "limits", "maximum amount", "minimum amount", "transaction limit", "withdrawal limit"]),
         ("eligibility", ["eligible", "eligibility", "who can", "can i", "allowed", "qualify"]),
         ("opening", ["open", "opening", "make", "create", "start", "set up", "setup", "apply", "register", "get an account", "get a card"]),
@@ -1063,18 +1063,55 @@ def search_tokens(text):
     }
 
 
+def normalized_text_for_similarity(text):
+    tokens = re.findall(r"[a-z0-9]+", str(text or "").lower())
+    return " ".join(normalize_search_token(token) for token in tokens if len(token) > 1)
+
+
+def char_ngrams(text, size=3):
+    compact = re.sub(r"[^a-z0-9]+", " ", normalized_text_for_similarity(text)).strip()
+    if not compact:
+        return set()
+    padded = f" {compact} "
+    if len(padded) <= size:
+        return {padded}
+    return {padded[index:index + size] for index in range(len(padded) - size + 1)}
+
+
+def set_overlap_score(left, right):
+    if not left or not right:
+        return 0.0
+    intersection = len(left & right)
+    return intersection / max(len(left), len(right), 1)
+
+
+def semantic_similarity(query, candidate):
+    query_tokens = expand_query_terms(query)
+    candidate_tokens = search_tokens(candidate)
+    token_score = set_overlap_score(query_tokens, candidate_tokens)
+    char_score = set_overlap_score(char_ngrams(query), char_ngrams(candidate))
+    sequence_score = SequenceMatcher(
+        None,
+        normalized_text_for_similarity(query),
+        normalized_text_for_similarity(candidate),
+    ).ratio()
+    return token_score * 0.45 + char_score * 0.35 + sequence_score * 0.20
+
+
 def expand_query_terms(text):
     terms = set(search_tokens(text))
     q = str(text or "").lower()
     if any(phrase in q for phrase in ["how long", "how many days", "when", "timeline", "take", "delay", "late", "wait"]):
         terms |= {"time", "timeline", "day", "working", "process", "processed", "processing", "review", "reviewed", "delay", "delayed"}
+    if terms & {"cost", "costs", "price", "yearly"}:
+        terms |= {"fee", "annual", "joining", "charge", "cost", "price", "yearly"}
     if any(phrase in q for phrase in ["what happens", "what if", "only pay", "after", "miss"]):
         terms |= {"happen", "result", "consequence", "impact", "charge", "interest", "fee", "forfeit", "forfeited", "redeem", "closure", "closed"}
     if terms & {"cashback", "reward", "rewards", "points"}:
         terms |= {"cashback", "reward", "rewards", "point", "points", "edge"}
     if terms & {"mile", "miles"}:
         terms |= {"mile", "miles", "edge", "travel"}
-    if any(phrase in q for phrase in ["best for", "who should", "who can use", "should use", "right for"]):
+    if any(phrase in q for phrase in ["best for", "who should", "who can use", "should use", "right for", "meant for"]):
         terms |= {"best", "for", "suitable", "recommended", "goal", "use", "traveller", "spender", "shopper"}
     if any(phrase in q for phrase in ["report phishing", "phishing", "vishing", "skimming", "what should i do next"]):
         terms |= {"report", "fraud", "phishing", "security", "dispute", "customer", "care", "block", "email", "call"}
@@ -1095,6 +1132,12 @@ def normalize_search_token(token):
         "cheaper": "lower",
         "lowest": "lower",
         "better": "best",
+        "cost": "fee",
+        "costs": "fee",
+        "costly": "fee",
+        "price": "fee",
+        "yearly": "annual",
+        "meant": "best",
     }
     if token in synonyms:
         return synonyms[token]
@@ -1188,7 +1231,8 @@ def build_previous_answer_candidate(current_query, previous_source):
         coverage = len(hits) / len(query_terms)
         density = len(hits) / max(len(unit_terms), 1)
         order_bonus = max(0.0, 1.0 - index * 0.03)
-        score = coverage * 30.0 + density * 12.0 + len(hits) * 2.5 + order_bonus
+        similarity = semantic_similarity(current_query, f"{unit.get('heading', '')} {unit_text}")
+        score = coverage * 24.0 + density * 10.0 + len(hits) * 2.0 + similarity * 35.0 + order_bonus
         ranked_units.append((score, index, unit))
 
     if not ranked_units:
@@ -1280,7 +1324,9 @@ def lexical_candidate_score(query, metadata, topic="", intent="general"):
     topic_bonus = score_topic_match(topic, candidate_text)
     intent_bonus = score_intent_match(intent, candidate_text)
     query_bonus = score_query_specific_match(query_text, question.lower(), candidate_text)
-    return exact_bonus + overlap * 6.0 + question_overlap * 24.0 + len(question_hits) * 7.0 + question_ratio * 3.0 + phrase_bonus + topic_bonus + intent_bonus + query_bonus
+    semantic_bonus = semantic_similarity(query_text, f"{question} {section}") * 18.0
+    body_semantic_bonus = semantic_similarity(query_text, candidate_text) * 8.0
+    return exact_bonus + overlap * 5.0 + question_overlap * 20.0 + len(question_hits) * 6.0 + question_ratio * 3.0 + phrase_bonus + topic_bonus + intent_bonus + query_bonus + semantic_bonus + body_semantic_bonus
 
 
 def score_query_specific_match(query_text, question_text, candidate_text):
@@ -1917,6 +1963,9 @@ def source_entity_label(source):
             continue
         if product.endswith("Credit Card") and re.search(rf"\b{re.escape(alias)}\b", text):
             return product
+    question = str(source.get("question", "")).strip()
+    if re.match(r"(?i)^what is (the )?.{3,80}\?$", question):
+        return question.rstrip("?")
     return ""
 
 
@@ -1930,7 +1979,7 @@ def is_product_attribute_followup(question):
     attribute_terms = {
         "fee", "annual", "joining", "cashback", "reward", "rewards", "point",
         "points", "mile", "miles", "best", "suitable", "use", "lounge",
-        "benefit", "benefits", "limit", "interest",
+        "benefit", "benefits", "limit", "interest", "cost", "price", "yearly",
     }
     return bool(terms & attribute_terms) or is_pronoun_reference(question)
 
@@ -1941,6 +1990,18 @@ def answer_comparison_followup(question, session):
         return None
     q_terms = expand_query_terms(question)
     if not q_terms:
+        return None
+    q_text = str(question or "").lower()
+    comparison_cues = {
+        "which", "one", "both", "between", "better", "best", "less", "lower",
+        "more", "compare", "comparison", "cost", "costs", "cheap", "cheaper",
+        "gives", "offers", "prefer", "worth",
+    }
+    comparison_phrases = [
+        "which one", "which is", "which has", "which gives", "between them",
+        "of these", "these two", "the first", "the second", "both cards",
+    ]
+    if not ((q_terms & comparison_cues) or any(phrase in q_text for phrase in comparison_phrases)):
         return None
     columns = table.get("columns") or []
     rows = table.get("rows") or []
@@ -2239,21 +2300,6 @@ def answer_message(message, language="English", session_id=None):
             "topic": comparison["topic"],
         }
 
-    comparison_followup = answer_comparison_followup(search_question, session)
-    if comparison_followup:
-        logger.info("answer.route comparison_followup session_id=%s question=%s", session_id, log_text(search_question))
-        reply = translate_answer(comparison_followup, language)
-        session["chat_history"].append({"role": "bot", "message": reply})
-        return {
-            "session_id": session_id,
-            "reply": reply,
-            "history": session["chat_history"],
-            "sources": [],
-            "suggested_questions": suggested_questions,
-            "topic": session.get("current_topic", ""),
-            "search_methods": ["comparison_context"],
-        }
-
     if is_account_recommendation_question(search_question):
         logger.info("answer.route recommendation session_id=%s question=%s", session_id, log_text(search_question))
         reply, recommendation_card = recommend_account(search_question)
@@ -2273,6 +2319,21 @@ def answer_message(message, language="English", session_id=None):
             ], language),
             "recommendation_card": recommendation_card,
             "topic": recommendation_topic,
+        }
+
+    comparison_followup = answer_comparison_followup(search_question, session)
+    if comparison_followup:
+        logger.info("answer.route comparison_followup session_id=%s question=%s", session_id, log_text(search_question))
+        reply = translate_answer(comparison_followup, language)
+        session["chat_history"].append({"role": "bot", "message": reply})
+        return {
+            "session_id": session_id,
+            "reply": reply,
+            "history": session["chat_history"],
+            "sources": [],
+            "suggested_questions": suggested_questions,
+            "topic": session.get("current_topic", ""),
+            "search_methods": ["comparison_context"],
         }
 
     pending_reply = handle_pending_flow(search_question, session)
