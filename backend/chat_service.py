@@ -54,6 +54,12 @@ BANKING_TOPIC_ALIASES = {
     "credit card": "credit card",
     "axis credit card": "credit card",
     "axis bank credit card": "credit card",
+    "credit card closure": "credit card closure",
+    "card closure": "credit card closure",
+    "close credit card": "credit card closure",
+    "close card": "credit card closure",
+    "cancel credit card": "credit card closure",
+    "cancel card": "credit card closure",
     "debit card": "debit card",
     "atm card": "debit card",
     "net banking": "net banking",
@@ -92,6 +98,7 @@ BANKING_VOCABULARY = set(
     "block", "blocking", "blocked", "lost", "stolen", "missing", "paper",
     "papers", "website", "online", "qualify", "qualified", "merchant", "valid",
     "investigate", "investigation", "record", "records", "evidence",
+    "close", "closing", "closed", "closure", "cancel", "cancellation",
 }
 
 QUERY_WORDS = {
@@ -265,6 +272,7 @@ def is_follow_up_question(user_question):
         "where do i file", "file online", "how long should i wait", "how many days",
         "what if", "where do i", "how do i", "does this", "can this", "is this",
         "should i keep", "records should i keep",
+        "same details", "same info", "same information", "as above",
     ]
     if any(re.search(rf"\b{re.escape(phrase)}\b", q) for phrase in phrases):
         return True
@@ -379,6 +387,7 @@ def remember_kb_source_context(session, source):
     session["last_kb_source"] = remembered_source
     if source_entity_label(remembered_source):
         session["last_entity_kb_source"] = remembered_source
+        session["last_comparison"] = {}
     history = session.setdefault("kb_source_history", [])
     source_key = (
         remembered_source.get("source_file", ""),
@@ -422,6 +431,7 @@ def detect_question_intent(question):
         ("limits", ["limit", "limits", "maximum amount", "minimum amount", "transaction limit", "withdrawal limit"]),
         ("eligibility", ["eligible", "eligibility", "who can", "can i get", "can i qualify", "am i eligible", "allowed", "qualify"]),
         ("opening", ["open", "opening", "make", "create", "start", "set up", "setup", "apply", "register", "get an account", "get a card"]),
+        ("closure", ["close", "closing", "closure", "cancel", "cancellation", "stop me from closing", "before closing"]),
         ("process", ["how can", "how do", "how to", "steps", "procedure", "process", "way to", "ways to", "help me", "apply from website", "apply online"]),
         ("definition", ["what is", "what are", "meaning", "define", "explain", "tell me about"]),
     ]
@@ -438,6 +448,8 @@ def build_intent_search_query(search_query, intent):
         return f"documents required proof KYC needed for {search_query}"
     if intent == "process":
         return f"steps process procedure how to {search_query}"
+    if intent == "closure":
+        return f"close cancel closure credit card outstanding dues redeem points request rights {search_query}"
     if intent == "dispute":
         return f"dispute chargeback fraud complaint ombudsman unauthorized suspicious lost stolen block report {search_query}"
     if intent == "fees":
@@ -710,6 +722,9 @@ def extract_topic_from_question(user_question):
     for alias in sorted(BANKING_TOPIC_ALIASES, key=len, reverse=True):
         if re.search(rf"\b{re.escape(alias)}\b", text):
             return BANKING_TOPIC_ALIASES[alias]
+    for alias, product in sorted(PRODUCT_ALIASES.items(), key=lambda item: len(item[0]), reverse=True):
+        if product != "Credit Card" and re.search(rf"\b{re.escape(alias)}\b", text):
+            return product.lower()
 
     remove_phrases = [
         "what is", "what are", "how can i", "how do i", "how to", "help me",
@@ -1107,6 +1122,8 @@ def expand_query_terms(text):
         terms |= {"complaint", "grievance", "ombudsman", "escalation", "resolve", "responded", "satisfactory", "unresolved"}
     if terms & {"approval", "approved"}:
         terms |= {"approval", "approved", "application", "processing", "review", "reviewed", "working", "day", "time", "process"}
+    if terms & {"close", "closed", "closing", "closure", "cancel", "cancellation"}:
+        terms |= {"close", "closed", "closing", "closure", "cancel", "cancellation", "outstanding", "dues", "redeem", "points", "lien", "rights", "request"}
     if terms & {"investigate", "investigation"}:
         terms |= {"investigate", "investigation", "chargeback", "dispute", "merchant", "response", "working", "day", "time"}
     if terms & {"merchant", "valid"}:
@@ -1145,6 +1162,10 @@ def normalize_search_token(token):
         "investigated": "investigation",
         "proves": "prove",
         "proved": "prove",
+        "closing": "closure",
+        "closed": "closure",
+        "cancel": "closure",
+        "cancellation": "closure",
         "waive": "waiver",
         "waived": "waiver",
         "charges": "charge",
@@ -1759,6 +1780,7 @@ def score_intent_match(intent, candidate_text):
         "tenure": ["tenure", "duration", "maturity", "period", "months", "years"],
         "limits": ["limit", "maximum", "minimum", "per day", "daily", "amount"],
         "eligibility": ["eligible", "eligibility", "who can", "can open", "allowed", "resident", "individual"],
+        "closure": ["close", "closure", "cancel", "cancellation", "outstanding dues", "redeem points", "written request", "card closure"],
         "definition": ["is a", "means", "refers to", "defined", "product where"],
     }
     negative = {
@@ -1766,6 +1788,7 @@ def score_intent_match(intent, candidate_text):
         "documents": ["what is", "meaning", "is a type"],
         "process": ["what is", "meaning", "is a type"],
         "dispute": ["emi conversion", "apply for", "eligible to apply", "annual fee waived", "reward points", "cashback", "increase or decrease", "credit limit"],
+        "closure": ["payment methods", "pay now", "neft", "upi", "billdesk", "auto-debit"],
         "definition": ["steps", "submit", "visit", "documents required", "opening"],
     }
     score = 0.0
@@ -2109,6 +2132,7 @@ def is_product_attribute_followup(question):
         "fee", "annual", "joining", "cashback", "reward", "rewards", "point",
         "points", "mile", "miles", "best", "suitable", "use", "lounge",
         "benefit", "benefits", "limit", "interest", "cost", "price", "yearly",
+        "detail", "details", "info", "information",
     }
     return bool(terms & attribute_terms) or is_pronoun_reference(question)
 
