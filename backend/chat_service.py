@@ -99,6 +99,7 @@ BANKING_VOCABULARY = set(
     "papers", "website", "online", "qualify", "qualified", "merchant", "valid",
     "investigate", "investigation", "record", "records", "evidence",
     "close", "closing", "closed", "closure", "cancel", "cancellation",
+    "change", "carry", "expire", "expires", "expiry", "forfeit", "forfeited",
 }
 
 QUERY_WORDS = {
@@ -1102,6 +1103,12 @@ def expand_query_terms(text):
         terms |= {"happen", "result", "consequence", "impact", "charge", "interest", "fee", "forfeit", "forfeited", "redeem", "closure", "closed"}
     if terms & {"cashback", "reward", "rewards", "points"}:
         terms |= {"cashback", "reward", "rewards", "point", "points", "edge", "benefit", "benefits", "earn", "earned", "credited"}
+    if terms & {"redeem", "redemption"}:
+        terms |= {"redeem", "redemption", "portal", "catalogue", "voucher", "cashback", "airmiles", "points", "edge"}
+    if terms & {"expire", "expires", "expiry", "forfeit", "forfeited"}:
+        terms |= {"expire", "expires", "expiry", "valid", "validity", "forfeit", "forfeited", "closure", "points", "edge"}
+    if terms & {"limit", "limits"} and terms & {"change", "carry"}:
+        terms |= {"limit", "limits", "credit", "carry", "change", "history", "replacement", "restored"}
     if terms & {"mile", "miles"}:
         terms |= {"mile", "miles", "edge", "travel", "flight", "hotel", "redeem", "redeemable", "reward", "currency"}
     if any(phrase in q for phrase in ["best for", "who should", "who can use", "should use", "right for", "meant for", "good for"]):
@@ -1158,6 +1165,9 @@ def normalize_search_token(token):
         "traveling": "travel",
         "traveller": "travel",
         "traveler": "travel",
+        "expires": "expire",
+        "expired": "expire",
+        "expiry": "expire",
         "investigate": "investigation",
         "investigated": "investigation",
         "proves": "prove",
@@ -1346,6 +1356,8 @@ def build_previous_answer_candidate(current_query, previous_source):
     context_bonus = 60.0 if temporal_query else 20.0 if len(query_terms) == 1 else 45.0
     if query_terms & {"record", "records", "evidence", "proof", "keep"}:
         context_bonus += 35.0
+    if query_terms & {"limit", "limits"} and query_terms & {"change", "carry", "replacement"} and search_tokens(answer) & {"limit", "limits", "carry", "restored"}:
+        context_bonus += 55.0
     return {
         "score": round(best_score + context_bonus, 4),
         "metadata": {
@@ -1440,6 +1452,25 @@ def score_query_specific_match(query_text, question_text, candidate_text):
             score += 16.0
         if question_terms & {"secure", "security"} and not (query_terms & {"secure", "security", "password", "otp", "pin"}):
             score -= 24.0
+    if query_terms & {"limit", "limits"} and query_terms & {"change", "carry", "replacement"}:
+        if candidate_terms & {"credit", "limit", "history", "carry", "replacement", "restored"}:
+            score += 34.0
+        if not (candidate_terms & {"limit", "limits"}):
+            score -= 40.0
+        if question_terms & {"waiver", "waived", "annual", "fee"}:
+            score -= 32.0
+        if question_terms & {"pin", "password"}:
+            score -= 36.0
+    if query_terms & {"redeem", "redemption"}:
+        if question_terms & {"redeem", "redemption"} or candidate_terms & {"portal", "catalogue", "voucher", "airmiles"}:
+            score += 38.0
+        if question_terms & {"earn", "earned"} and not (question_terms & {"redeem", "redemption"}):
+            score -= 32.0
+    if query_terms & {"expire", "expires", "expiry", "forfeit", "forfeited"}:
+        if question_terms & {"expire", "expiry", "forfeit", "closure"} or candidate_terms & {"valid", "validity", "forfeit", "forfeited", "closure"}:
+            score += 38.0
+        if question_terms & {"earn", "earned"} and not (question_terms & {"expire", "expiry", "forfeit"}):
+            score -= 32.0
     unauthorized_action_terms = {"unauthorized", "permission", "fraud", "suspicious", "strange", "block", "report", "immediate"}
     if query_terms & unauthorized_action_terms:
         if question_terms & {"immediate", "what", "should"} or candidate_terms & {"immediate", "minutes", "hours", "block", "report"}:
