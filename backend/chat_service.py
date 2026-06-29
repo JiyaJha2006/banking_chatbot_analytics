@@ -89,6 +89,9 @@ BANKING_VOCABULARY = set(
     "annual", "joining", "limit", "limits", "cardholder", "phishing", "vishing",
     "skimming", "malware", "spoofing", "harassment", "mile", "miles", "waiver",
     "waived", "travel", "traveller", "flight", "hotel", "replacement", "replace",
+    "block", "blocking", "blocked", "lost", "stolen", "missing", "paper",
+    "papers", "website", "online", "qualify", "qualified", "merchant", "valid",
+    "investigate", "investigation", "record", "records", "evidence",
 }
 
 QUERY_WORDS = {
@@ -261,6 +264,7 @@ def is_follow_up_question(user_question):
         "better one", "how long", "what next", "then what", "what should i do next",
         "where do i file", "file online", "how long should i wait", "how many days",
         "what if", "where do i", "how do i", "does this", "can this", "is this",
+        "should i keep", "records should i keep",
     ]
     if any(re.search(rf"\b{re.escape(phrase)}\b", q) for phrase in phrases):
         return True
@@ -268,7 +272,8 @@ def is_follow_up_question(user_question):
         "late", "interest", "fee", "fees", "charge", "charges", "cashback", "reward",
         "rewards", "points", "documents", "limit", "limits", "online", "next",
         "complaint", "resolve", "resolved", "solve", "solved", "delay", "delayed",
-        "waiver", "waived", "miles", "mile", "proof", "replacement", "replace",
+        "waiver", "waived", "miles", "mile", "proof", "record", "records",
+        "evidence", "replacement", "replace",
     }
     if len(q.split()) <= 3 and search_tokens(q) & short_follow_up_terms:
         return True
@@ -415,9 +420,9 @@ def detect_question_intent(question):
         ("interest", ["interest rate", "rate of interest", "returns", "interest earned", "how much interest"]),
         ("tenure", ["how long", "how many days", "tenure", "duration", "maturity period", "term period"]),
         ("limits", ["limit", "limits", "maximum amount", "minimum amount", "transaction limit", "withdrawal limit"]),
-        ("eligibility", ["eligible", "eligibility", "who can", "can i", "allowed", "qualify"]),
+        ("eligibility", ["eligible", "eligibility", "who can", "can i get", "can i qualify", "am i eligible", "allowed", "qualify"]),
         ("opening", ["open", "opening", "make", "create", "start", "set up", "setup", "apply", "register", "get an account", "get a card"]),
-        ("process", ["how can", "how do", "how to", "steps", "procedure", "process", "way to", "ways to", "help me"]),
+        ("process", ["how can", "how do", "how to", "steps", "procedure", "process", "way to", "ways to", "help me", "apply from website", "apply online"]),
         ("definition", ["what is", "what are", "meaning", "define", "explain", "tell me about"]),
     ]
     for intent, phrases in intent_rules:
@@ -788,6 +793,8 @@ def is_banking_related_question(question, session):
     }
     if any(phrase in text for phrase in banking_phrases):
         return True
+    if session.get("last_comparison") and answer_comparison_followup(text, session):
+        return True
     return bool(
         is_follow_up_question(text)
         and (session.get("current_topic") or session.get("last_kb_source") or session.get("kb_source_history"))
@@ -1068,6 +1075,8 @@ def semantic_similarity(query, candidate):
 def expand_query_terms(text):
     terms = set(search_tokens(text))
     q = str(text or "").lower()
+    if ("card" in terms and (terms & {"lost", "stolen", "missing"})) or any(phrase in q for phrase in ["card is missing", "missing card"]):
+        terms |= {"lost", "stolen", "missing", "block", "blocked", "blocking", "replacement", "replace", "report", "immediate", "steps"}
     if any(phrase in q for phrase in ["how long", "how many days", "when", "timeline", "take", "delay", "late", "wait"]):
         terms |= {"time", "timeline", "day", "working", "process", "processed", "processing", "review", "reviewed", "delay", "delayed"}
     if terms & {"cost", "costs", "price", "yearly", "charge", "charges"} or "every year" in q:
@@ -1084,16 +1093,26 @@ def expand_query_terms(text):
         terms |= {"best", "for", "suitable", "recommended", "goal", "use", "traveller", "travel", "spender", "shopper", "shopping", "food", "delivery"}
     if any(phrase in q for phrase in ["report phishing", "phishing", "vishing", "skimming", "what should i do next"]):
         terms |= {"report", "fraud", "phishing", "security", "dispute", "customer", "care", "block", "email", "call"}
-    if terms & {"unauthorized", "permission", "strange", "suspicious", "fraudulent"} or any(phrase in q for phrase in ["without permission", "not done by me", "someone used", "unknown transaction"]):
+    if terms & {"unauthorized", "permission", "strange", "suspicious", "fraudulent"} or any(phrase in q for phrase in ["without permission", "not done by me", "did not do", "not mine", "not me", "someone used", "someone made", "unknown transaction"]):
         terms |= {"unauthorized", "fraud", "fraudulent", "suspicious", "strange", "dispute", "transaction", "chargeback", "block", "report", "liability", "immediate", "steps", "minutes", "hours"}
     if terms & {"proof", "document", "documents", "evidence", "keep"}:
-        terms |= {"proof", "document", "documents", "evidence", "record", "date", "time", "merchant", "amount", "transaction"}
+        terms |= {"proof", "document", "documents", "evidence", "record", "records", "communication", "reference", "date", "time", "merchant", "amount", "transaction"}
+    if terms & {"paper", "papers"}:
+        terms |= {"document", "documents", "proof", "kyc", "identity", "address", "income"}
     if terms & {"reject", "rejected", "deny", "denied"}:
         terms |= {"reject", "rejected", "chargeback", "temporary", "credit", "reversed", "debit"}
     if terms & {"complaint", "complain", "resolve", "unresolved"}:
         terms |= {"complaint", "complain", "resolve", "unresolved", "grievance", "ombudsman", "escalation", "escalate", "satisfactory", "responded"}
     if "rbi" in terms and (terms & {"day", "working", "time", "wait", "delayed", "timeline"}):
         terms |= {"complaint", "grievance", "ombudsman", "escalation", "resolve", "responded", "satisfactory", "unresolved"}
+    if terms & {"approval", "approved"}:
+        terms |= {"approval", "approved", "application", "processing", "review", "reviewed", "working", "day", "time", "process"}
+    if terms & {"investigate", "investigation"}:
+        terms |= {"investigate", "investigation", "chargeback", "dispute", "merchant", "response", "working", "day", "time"}
+    if terms & {"merchant", "valid"}:
+        terms |= {"merchant", "valid", "prove", "proof", "chargeback", "temporary", "credit", "reversed", "legitimate"}
+    if terms & {"qualify", "qualified"} or "can i get" in q:
+        terms |= {"eligible", "eligibility", "apply", "application", "resident", "age", "income", "employment"}
     return terms
 
 
@@ -1115,6 +1134,17 @@ def normalize_search_token(token):
         "price": "fee",
         "yearly": "annual",
         "meant": "best",
+        "missing": "lost",
+        "papers": "document",
+        "paper": "document",
+        "travelling": "travel",
+        "traveling": "travel",
+        "traveller": "travel",
+        "traveler": "travel",
+        "investigate": "investigation",
+        "investigated": "investigation",
+        "proves": "prove",
+        "proved": "prove",
         "waive": "waiver",
         "waived": "waiver",
         "charges": "charge",
@@ -1227,11 +1257,18 @@ def build_previous_answer_candidate(current_query, previous_source):
     query_terms = expand_query_terms(current_query)
     if not answer or not query_terms:
         return None
+    previous_terms = search_tokens(f"{previous_source.get('question', '')} {answer}")
+    if query_terms & {"investigation", "chargeback"} and not (previous_terms & {"investigation", "chargeback", "provisional", "temporary"}):
+        return None
+    if query_terms & {"merchant", "valid", "prove"} and not (previous_terms & {"chargeback", "legitimate", "reversed", "temporary", "provisional"}):
+        return None
 
     ranked_units = []
     temporal_query = bool(re.search(r"\b(how long|how many days|when|timeline|take|delay|late)\b", str(current_query or "").lower()))
     temporal_terms = {"time", "timeline", "day", "working", "process", "processed", "processing", "review", "reviewed", "delay", "delayed", "approval", "approved"}
     required_temporal_terms = expand_query_terms(current_query) & {"investigation", "approval", "closure", "complaint", "dispute", "chargeback"}
+    if expand_query_terms(current_query) & {"investigation", "chargeback"}:
+        required_temporal_terms = {"investigation", "chargeback", "merchant", "provisional"}
     action_followup = bool(re.search(r"\b(next|what should i do|what do i do)\b", str(current_query or "").lower()))
     action_terms = {"report", "call", "email", "visit", "file", "block", "contact", "request", "submit", "redeem"}
     units = split_answer_units(answer)
@@ -1286,6 +1323,8 @@ def build_previous_answer_candidate(current_query, previous_source):
         return None
 
     context_bonus = 60.0 if temporal_query else 20.0 if len(query_terms) == 1 else 45.0
+    if query_terms & {"record", "records", "evidence", "proof", "keep"}:
+        context_bonus += 35.0
     return {
         "score": round(best_score + context_bonus, 4),
         "metadata": {
@@ -1370,6 +1409,16 @@ def score_query_specific_match(query_text, question_text, candidate_text):
     score = title_coverage * 10.0 + body_coverage * 3.0
     if "mile" in question_terms and "mile" not in query_terms:
         score -= 45.0
+    if query_terms & {"lost", "stolen", "missing", "block", "blocking"}:
+        if question_terms & {"lost", "stolen", "block"} or candidate_terms & {"block", "blocked", "blocking", "replacement"}:
+            score += 30.0
+        if question_terms & {"miss", "late", "payment"} and not (query_terms & {"late", "delayed"}):
+            score -= 26.0
+    if query_terms & {"record", "records", "evidence", "proof", "keep"}:
+        if candidate_terms & {"communication", "reference", "record", "records", "merchant", "amount", "date", "time", "transaction"}:
+            score += 16.0
+        if question_terms & {"secure", "security"} and not (query_terms & {"secure", "security", "password", "otp", "pin"}):
+            score -= 24.0
     unauthorized_action_terms = {"unauthorized", "permission", "fraud", "suspicious", "strange", "block", "report", "immediate"}
     if query_terms & unauthorized_action_terms:
         if question_terms & {"immediate", "what", "should"} or candidate_terms & {"immediate", "minutes", "hours", "block", "report"}:
@@ -1387,6 +1436,35 @@ def score_query_specific_match(query_text, question_text, candidate_text):
             score += 26.0
         if question_terms & {"interest"} and not (question_terms & {"complaint", "resolve", "unresolved", "ombudsman"}):
             score -= 18.0
+    if query_terms & {"eligible", "eligibility", "qualify", "qualified"}:
+        if question_terms & {"eligible", "eligibility", "apply"} or candidate_terms & {"eligible", "eligibility", "age", "income", "employment"}:
+            score += 24.0
+        if question_terms & {"waiver", "waived"}:
+            score -= 28.0
+    if query_terms & {"apply", "application"} and query_terms & {"website", "online"}:
+        if question_terms & {"apply", "online"} or candidate_terms & {"website", "apply", "online", "application"}:
+            score += 30.0
+        if question_terms & {"document", "documents"}:
+            score -= 16.0
+    if query_terms & {"approval", "approved"} and query_terms & {"day", "time", "working"}:
+        if question_terms & {"apply", "application", "approved", "approval"} or candidate_terms & {"processing", "reviewed", "approval", "application", "working"}:
+            score += 34.0
+        if question_terms & {"late", "payment"}:
+            score -= 24.0
+    if query_terms & {"investigation", "chargeback"} and query_terms & {"day", "time", "working"}:
+        if question_terms & {"chargeback", "investigation"} or candidate_terms & {"chargeback", "investigation", "merchant", "provisional"}:
+            score += 48.0
+        if question_terms & {"fee", "late", "payment"}:
+            score -= 26.0
+    if query_terms & {"merchant", "valid", "prove"}:
+        if question_terms & {"chargeback", "investigation"} or candidate_terms & {"prove", "legitimate", "rejected", "reversed", "response"}:
+            score += 82.0
+        if question_terms & {"fee", "late", "payment"}:
+            score -= 24.0
+        if question_terms & {"interest"} and not (question_terms & {"chargeback", "investigation"}):
+            score -= 32.0
+        if question_terms & {"immediate"} and not (question_terms & {"chargeback", "investigation"}):
+            score -= 35.0
     return score
 
 
@@ -1570,7 +1648,7 @@ def retrieve_lightweight_official_answer(query, topic="", intent="general", sess
             and normalize_match_text(previous_source.get("question", "")) == normalize_match_text(metadata.get("question", ""))
             and normalize_match_text(current_query) != normalize_match_text(metadata.get("question", ""))
         ):
-            score += 26.0
+            score += 70.0
         if (
             follow_up
             and previous_source.get("question")
@@ -1578,6 +1656,14 @@ def retrieve_lightweight_official_answer(query, topic="", intent="general", sess
             and normalize_match_text(previous_source.get("question", "")) == normalize_match_text(metadata.get("question", ""))
         ):
             score += 10.0
+        if (
+            follow_up
+            and query_terms & {"record", "records", "evidence", "proof", "keep"}
+            and previous_source.get("question")
+            and normalize_match_text(previous_source.get("question", "")) == normalize_match_text(metadata.get("question", ""))
+            and search_tokens(previous_source.get("answer", "")) & {"record", "records", "communication", "reference"}
+        ):
+            score += 35.0
         if (
             follow_up
             and previous_source.get("question")
@@ -1604,7 +1690,7 @@ def retrieve_lightweight_official_answer(query, topic="", intent="general", sess
                 continue
             recency_penalty = source_index * 4.0
             if entity_source and source.get("question") == entity_source.get("question") and is_product_attribute_followup(current_query):
-                recency_penalty -= 30.0
+                recency_penalty -= 42.0
             candidate["score"] = max(0.0, candidate["score"] - recency_penalty)
             candidate["metadata"]["hybrid_score"] = round(candidate["score"], 4)
             previous_answer_candidates.append(candidate)
@@ -1825,6 +1911,10 @@ PRODUCT_ALIASES = {
     "axis atlas": "Atlas Credit Card",
     "axis bank atlas": "Atlas Credit Card",
     "axis bank atlas credit card": "Atlas Credit Card",
+    "airtel": "Airtel Axis Bank Credit Card",
+    "airtel axis": "Airtel Axis Bank Credit Card",
+    "airtel axis card": "Airtel Axis Bank Credit Card",
+    "airtel axis bank credit card": "Airtel Axis Bank Credit Card",
     "fd": "Fixed Deposit",
     "fixed deposit": "Fixed Deposit",
     "rd": "Recurring Deposit",
@@ -1873,6 +1963,13 @@ PRODUCT_FEATURES = {
         "Best for": "Short-term credit and rewards",
         "Flexibility": "High, but needs discipline",
         "Typical use": "Purchases, bills, online payments",
+    },
+    "Airtel Axis Bank Credit Card": {
+        "Fee": "Rs. 500 + GST",
+        "Rewards": "25% cashback on Airtel services, 10% on selected food/grocery apps, 1% on other spends",
+        "Best for": "Airtel users and people who spend on recharges, broadband, DTH, food delivery, and groceries",
+        "Flexibility": "Cashback is credited to the card account",
+        "Typical use": "Airtel bills, recharges, broadband, DTH, Swiggy, BigBasket, Zomato",
     },
     "Debit Card": {
         "Deposit": "Uses money from bank account",
@@ -2027,7 +2124,7 @@ def answer_comparison_followup(question, session):
     comparison_cues = {
         "which", "one", "both", "between", "better", "best", "less", "lower",
         "more", "compare", "comparison", "cost", "costs", "cheap", "cheaper",
-        "gives", "offers", "prefer", "worth",
+        "gives", "offers", "prefer", "worth", "travel", "travelling",
     }
     comparison_phrases = [
         "which one", "which is", "which has", "which gives", "between them",
@@ -2048,6 +2145,24 @@ def answer_comparison_followup(question, session):
         hits = q_terms & terms
         if hits:
             ranked_rows.append((len(hits), feature, row))
+    lower_words = {"lower", "less", "cheap", "cheaper", "lowest"}
+    shopping_words = {"shopping", "shop", "online", "flipkart", "myntra"}
+    cashback_words = {"cashback", "reward", "rewards"}
+    travel_words = {"travel", "travelling", "flight", "hotel", "mile", "miles"}
+    if not ranked_rows:
+        fallback_feature = ""
+        if q_terms & lower_words:
+            fallback_feature = "Fee"
+        elif q_terms & travel_words:
+            fallback_feature = "Typical use"
+        elif q_terms & cashback_words:
+            fallback_feature = "Rewards"
+        elif q_terms & shopping_words:
+            fallback_feature = "Typical use"
+        for row in rows:
+            if str(row.get("feature", "")).lower() == fallback_feature.lower():
+                ranked_rows.append((1, str(row.get("feature", "")), row))
+                break
     if not ranked_rows:
         return None
     ranked_rows.sort(key=lambda item: item[0], reverse=True)
@@ -2056,15 +2171,14 @@ def answer_comparison_followup(question, session):
     left_value = str(row.get(left, "-"))
     right_value = str(row.get(right, "-"))
 
-    lower_words = {"lower", "less", "cheap", "cheaper", "lowest"}
-    shopping_words = {"shopping", "shop", "online", "flipkart", "myntra"}
-    cashback_words = {"cashback", "reward", "rewards"}
     if q_terms & lower_words:
         answer = f"For {feature.lower()}, {left} has: {left_value}. {right} has: {right_value}."
     elif q_terms & shopping_words:
         answer = f"For shopping, compare the '{feature}' row: {left}: {left_value}. {right}: {right_value}."
     elif q_terms & cashback_words:
         answer = f"For cashback/rewards, {left}: {left_value}. {right}: {right_value}."
+    elif q_terms & travel_words:
+        answer = f"For travel use, compare the '{feature}' row: {left}: {left_value}. {right}: {right_value}."
     else:
         answer = f"For {feature.lower()}, {left}: {left_value}. {right}: {right_value}."
     return answer
