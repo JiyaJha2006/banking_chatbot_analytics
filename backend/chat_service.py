@@ -1187,12 +1187,16 @@ def expand_query_terms(text):
         terms |= {"happen", "result", "consequence", "impact", "charge", "interest", "fee", "forfeit", "forfeited", "redeem", "closure", "closed"}
     if terms & {"cashback", "reward", "rewards", "points"}:
         terms |= {"cashback", "reward", "rewards", "point", "points", "edge", "benefit", "benefits", "earn", "earned", "credited"}
+    if terms & {"value", "worth", "rupee", "paise"}:
+        terms |= {"value", "worth", "rupee", "paise", "rate", "redemption", "redeem", "points", "edge"}
     if terms & {"redeem", "redemption"}:
         terms |= {"redeem", "redemption", "portal", "catalogue", "voucher", "cashback", "airmiles", "points", "edge"}
     if terms & {"expire", "expires", "expiry", "forfeit", "forfeited"}:
         terms |= {"expire", "expires", "expiry", "valid", "validity", "forfeit", "forfeited", "closure", "points", "edge"}
+    if terms & {"limit", "limits"}:
+        terms |= {"limit", "limits", "credit", "available", "reduce", "reduces", "reduced", "restore", "restored"}
     if terms & {"limit", "limits"} and terms & {"change", "carry"}:
-        terms |= {"limit", "limits", "credit", "carry", "change", "history", "replacement", "restored"}
+        terms |= {"carry", "change", "history", "replacement", "restored"}
     if terms & {"mile", "miles"}:
         terms |= {"mile", "miles", "edge", "travel", "flight", "hotel", "redeem", "redeemable", "reward", "currency"}
     if any(phrase in q for phrase in ["best for", "who should", "who can use", "should use", "right for", "meant for", "good for"]):
@@ -1207,7 +1211,7 @@ def expand_query_terms(text):
         terms |= {"document", "documents", "proof", "kyc", "identity", "address", "income"}
     if terms & {"reject", "rejected", "deny", "denied"}:
         terms |= {"reject", "rejected", "chargeback", "temporary", "credit", "reversed", "debit"}
-    if terms & {"complaint", "complain", "resolve", "unresolved"}:
+    if terms & {"complaint", "complain", "resolve", "unresolved"} or any(phrase in q for phrase in ["does not resolve", "doesn't resolve", "not resolve", "not resolved"]):
         terms |= {"complaint", "complain", "resolve", "unresolved", "grievance", "ombudsman", "escalation", "escalate", "satisfactory", "responded"}
     if "rbi" in terms and (terms & {"day", "working", "time", "wait", "delayed", "timeline"}):
         terms |= {"complaint", "grievance", "ombudsman", "escalation", "resolve", "responded", "satisfactory", "unresolved"}
@@ -1254,8 +1258,11 @@ def normalize_search_token(token):
         "expiry": "expire",
         "investigate": "investigation",
         "investigated": "investigation",
+        "liable": "liability",
         "proves": "prove",
         "proved": "prove",
+        "worth": "value",
+        "valued": "value",
         "closing": "closure",
         "closed": "closure",
         "cancel": "closure",
@@ -1370,6 +1377,14 @@ def expand_selected_answer_unit_indexes(units, ranked_units, selected_indexes):
 def build_previous_answer_candidate(current_query, previous_source):
     answer = str(previous_source.get("answer", ""))
     query_terms = expand_query_terms(current_query)
+    direct_query_terms = search_tokens(current_query)
+    direct_focus_terms = set(direct_query_terms)
+    if direct_query_terms & {"approval", "approved"} or "how long" in str(current_query or "").lower():
+        direct_focus_terms |= {"application", "processing", "review", "reviewed", "time", "day", "working", "dispatch", "dispatched"}
+    if direct_query_terms & {"value", "worth"}:
+        direct_focus_terms |= {"point", "points", "paise", "rupee", "redemption"}
+    if direct_query_terms & {"liability", "zero"}:
+        direct_focus_terms |= {"liability", "zero", "fraud", "unauthorized", "report", "reversal"}
     if not answer or not query_terms:
         logger.info(
             "previous_answer.skip reason=no_answer_or_terms query=%s source=%s",
@@ -1384,10 +1399,10 @@ def build_previous_answer_candidate(current_query, previous_source):
         sorted(query_terms),
         log_source_summary(previous_source),
     )
-    if query_terms & {"investigation", "chargeback"} and not (previous_terms & {"investigation", "chargeback", "provisional", "temporary"}):
+    if direct_query_terms & {"investigation", "chargeback"} and not (previous_terms & {"investigation", "chargeback", "provisional", "temporary"}):
         logger.info("previous_answer.skip reason=missing_investigation_context query=%s source=%s", log_text(current_query), log_source_summary(previous_source))
         return None
-    if query_terms & {"merchant", "valid", "prove"} and not (previous_terms & {"chargeback", "legitimate", "reversed", "temporary", "provisional"}):
+    if direct_query_terms & {"merchant", "valid", "prove"} and not (previous_terms & {"chargeback", "legitimate", "reversed", "temporary", "provisional"}):
         logger.info("previous_answer.skip reason=missing_merchant_context query=%s source=%s", log_text(current_query), log_source_summary(previous_source))
         return None
 
@@ -1409,6 +1424,12 @@ def build_previous_answer_candidate(current_query, previous_source):
         if not unit_terms:
             continue
         hits = query_terms & unit_terms
+        direct_hits = direct_focus_terms & unit_terms
+        similarity = semantic_similarity(current_query, f"{unit.get('heading', '')} {unit_text}")
+        if not direct_hits and similarity < 0.22:
+            continue
+        if len(direct_query_terms) >= 3 and len(direct_hits) < 2 and similarity < 0.28:
+            continue
         if temporal_query and not (unit_text_terms & temporal_terms):
             continue
         if temporal_query and required_temporal_terms and not (unit_text_terms & required_temporal_terms):
@@ -1423,8 +1444,7 @@ def build_previous_answer_candidate(current_query, previous_source):
         coverage = len(hits) / len(query_terms)
         density = len(hits) / max(len(unit_terms), 1)
         order_bonus = max(0.0, 1.0 - index * 0.03)
-        similarity = semantic_similarity(current_query, f"{unit.get('heading', '')} {unit_text}")
-        score = coverage * 24.0 + density * 10.0 + len(hits) * 2.0 + similarity * 35.0 + order_bonus
+        score = coverage * 20.0 + density * 8.0 + len(hits) * 1.5 + len(direct_hits) * 8.0 + similarity * 35.0 + order_bonus
         ranked_units.append((score, index, unit))
 
     if not ranked_units:
@@ -1569,6 +1589,11 @@ def score_query_specific_match(query_text, question_text, candidate_text):
             score += 30.0
         if question_terms & {"miss", "late", "payment"} and not (query_terms & {"late", "delayed"}):
             score -= 26.0
+    if query_terms & {"due", "date", "delayed"} and query_terms & {"pay", "payment", "after", "happen", "consequence"}:
+        if question_terms & {"miss", "payment", "due", "date"} or candidate_terms & {"late", "fee", "interest", "outstanding", "grace", "score"}:
+            score += 48.0
+        if question_terms & {"pay"} and not (question_terms & {"miss", "delayed", "late"}):
+            score -= 18.0
     if query_terms & {"record", "records", "evidence", "proof", "keep"}:
         if candidate_terms & {"communication", "reference", "record", "records", "merchant", "amount", "date", "time", "transaction"}:
             score += 16.0
@@ -1583,11 +1608,28 @@ def score_query_specific_match(query_text, question_text, candidate_text):
             score -= 32.0
         if question_terms & {"pin", "password"}:
             score -= 36.0
+    if query_terms & {"emi"} and query_terms & {"limit", "limits", "credit"}:
+        if question_terms & {"emi"} and candidate_terms & {"principal", "available", "restored", "limit"}:
+            score += 70.0
+        if question_terms & {"miss", "payment", "delayed"}:
+            score -= 34.0
+    elif query_terms & {"limit", "limits", "credit"} and query_terms & {"available", "reduce", "reduced", "restore", "restored"}:
+        if candidate_terms & {"available", "reduce", "reduced", "restore", "restored", "principal"}:
+            score += 34.0
     if query_terms & {"redeem", "redemption"}:
         if question_terms & {"redeem", "redemption"} or candidate_terms & {"portal", "catalogue", "voucher", "airmiles"}:
             score += 38.0
         if question_terms & {"earn", "earned"} and not (question_terms & {"redeem", "redemption"}):
             score -= 32.0
+    if query_terms & {"value", "worth", "paise", "rupee"}:
+        if question_terms & {"value", "worth"} or candidate_terms & {"point", "points", "value", "worth", "paise", "rupee"}:
+            score += 70.0
+        if candidate_terms & {"value", "paise", "rupee"} and candidate_terms & {"point", "points"}:
+            score += 55.0
+        if question_terms & {"earn", "earned"} and not (question_terms & {"value", "worth"}):
+            score -= 80.0
+        if question_terms & {"expire", "expiry", "forfeit"} and not (question_terms & {"value", "worth"}):
+            score -= 28.0
     if query_terms & {"expire", "expires", "expiry", "forfeit", "forfeited"}:
         if question_terms & {"expire", "expiry", "forfeit", "closure"} or candidate_terms & {"valid", "validity", "forfeit", "forfeited", "closure"}:
             score += 38.0
@@ -1605,6 +1647,11 @@ def score_query_specific_match(query_text, question_text, candidate_text):
             score += 28.0
         elif not (candidate_terms & complaint_terms):
             score -= 10.0
+    if query_terms & {"resolve", "unresolved", "ombudsman", "grievance", "escalation"}:
+        if question_terms & {"resolve", "unresolved", "ombudsman", "grievance"} or candidate_terms & {"ombudsman", "nodal", "escalation", "satisfactory"}:
+            score += 52.0
+        if question_terms & {"chargeback", "investigation"} and not (question_terms & {"resolve", "unresolved", "ombudsman", "grievance"}):
+            score -= 30.0
     if "rbi" in query_terms and query_terms & {"day", "time", "wait", "delayed", "timeline"}:
         if question_terms & {"complaint", "resolve", "unresolved", "ombudsman", "grievance"}:
             score += 26.0
@@ -1625,6 +1672,15 @@ def score_query_specific_match(query_text, question_text, candidate_text):
             score += 34.0
         if question_terms & {"late", "payment"}:
             score -= 24.0
+        if question_terms & {"reject", "rejected"}:
+            score -= 40.0
+    if query_terms & {"liability", "zero"}:
+        if question_terms & {"liable", "liability"} or candidate_terms & {"zero", "liability", "unauthorized", "fraud", "reversal"}:
+            score += 95.0
+        if question_terms & {"closure", "close"} and not (question_terms & {"liable", "liability"}):
+            score -= 48.0
+        if question_terms & {"interest"} and not (question_terms & {"liable", "liability"}):
+            score -= 62.0
     if query_terms & {"investigation", "chargeback"} and query_terms & {"day", "time", "working"}:
         if question_terms & {"chargeback", "investigation"} or candidate_terms & {"chargeback", "investigation", "merchant", "provisional"}:
             score += 48.0
@@ -1812,9 +1868,9 @@ def retrieve_lightweight_official_answer(query, topic="", intent="general", sess
         score = lexical_candidate_score(current_query, metadata, topic, intent)
         if follow_up:
             if query != current_query:
-                score += lexical_candidate_score(query, metadata, topic, intent) * 0.05
+                score += lexical_candidate_score(query, metadata, topic, intent) * 0.12
             if contextual_query not in {query, current_query}:
-                score += lexical_candidate_score(contextual_query, metadata, topic, intent) * 0.05
+                score += lexical_candidate_score(contextual_query, metadata, topic, intent) * 0.18
             question_terms = search_tokens(metadata.get("question", ""))
             direct_title_hits = query_terms & question_terms
             if direct_title_hits:
