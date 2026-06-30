@@ -139,6 +139,7 @@ BANKING_VOCABULARY = set(
     "investigate", "investigation", "record", "records", "evidence",
     "close", "closing", "closed", "closure", "cancel", "cancellation",
     "change", "carry", "expire", "expires", "expiry", "forfeit", "forfeited",
+    "maturity", "mature", "premature", "break", "early",
 }
 
 QUERY_WORDS = {
@@ -311,6 +312,7 @@ def is_follow_up_question(user_question):
         "documents needed", "required documents", "explain more", "tell me more",
         "what about", "does it", "can it", "is it", "which is better",
         "better one", "how long", "what next", "then what", "what should i do next",
+        "what happens", "at maturity",
         "where do i file", "file online", "how long should i wait", "how many days",
         "what if", "where do i", "how do i", "does this", "can this", "is this",
         "should i keep", "records should i keep",
@@ -2179,6 +2181,12 @@ PRODUCT_ALIASES = {
     "debit card": "Debit Card",
     "home loan": "Home Loan",
     "personal loan": "Personal Loan",
+    "upi": "UPI",
+    "neft": "NEFT",
+    "rtgs": "RTGS",
+    "net banking": "Net Banking",
+    "netbanking": "Net Banking",
+    "internet banking": "Net Banking",
 }
 
 PRODUCT_FEATURES = {
@@ -2245,6 +2253,34 @@ PRODUCT_FEATURES = {
         "Flexibility": "Medium",
         "Typical use": "Medical, travel, education, emergency needs",
     },
+    "UPI": {
+        "Deposit": "No deposit; it links to your bank account",
+        "Interest": "No interest; it is a payment method",
+        "Best for": "Instant small and everyday payments",
+        "Flexibility": "High",
+        "Typical use": "QR payments, mobile transfers, merchant payments",
+    },
+    "NEFT": {
+        "Deposit": "Bank-to-bank fund transfer",
+        "Interest": "No interest; it is a transfer method",
+        "Best for": "Non-urgent transfers between bank accounts",
+        "Flexibility": "Processed in batches or as per bank/RBI timings",
+        "Typical use": "Account transfers where instant settlement is not required",
+    },
+    "RTGS": {
+        "Deposit": "High-value bank-to-bank fund transfer",
+        "Interest": "No interest; it is a transfer method",
+        "Best for": "Large-value transfers that need quick settlement",
+        "Flexibility": "Usually used for higher-value transfers",
+        "Typical use": "Large business or personal transfers",
+    },
+    "Net Banking": {
+        "Deposit": "Online access to bank account services",
+        "Interest": "No interest; it is a digital banking channel",
+        "Best for": "Managing bank services from a browser or app",
+        "Flexibility": "High",
+        "Typical use": "Fund transfers, statements, bill payments, service requests",
+    },
     "ACE Credit Card": {
         "Fee": "Rs. 499 + GST",
         "Rewards": "5% utility bill cashback via Google Pay; 4% on Swiggy, Zomato, Ola; 2% on other spends",
@@ -2269,6 +2305,83 @@ PRODUCT_FEATURES = {
 }
 
 
+GENERAL_BANKING_TOPICS = {
+    "fd": "Fixed Deposit",
+    "fixed deposit": "Fixed Deposit",
+    "rd": "Recurring Deposit",
+    "recurring deposit": "Recurring Deposit",
+    "savings account": "Savings Account",
+    "saving account": "Savings Account",
+    "current account": "Current Account",
+    "upi": "UPI",
+    "UPI": "UPI",
+    "neft": "NEFT",
+    "NEFT": "NEFT",
+    "rtgs": "RTGS",
+    "RTGS": "RTGS",
+    "net banking": "Net Banking",
+    "netbanking": "Net Banking",
+    "internet banking": "Net Banking",
+}
+
+
+def general_banking_product_name(topic):
+    return GENERAL_BANKING_TOPICS.get(str(topic or "").strip().lower()) or GENERAL_BANKING_TOPICS.get(str(topic or "").strip())
+
+
+def should_use_general_banking_reference(topic):
+    product_name = general_banking_product_name(topic)
+    return bool(product_name and product_name not in {"Credit Card"})
+
+
+def build_general_banking_reference_answer(question, topic, intent="general"):
+    product_name = general_banking_product_name(topic)
+    if not product_name:
+        return "", []
+    features = PRODUCT_FEATURES.get(product_name, {})
+    q_terms = expand_query_terms(question)
+    category = detect_product_category(product_name.lower())
+
+    if q_terms & {"break", "early", "premature", "withdraw"} and product_name in {"Fixed Deposit", "Recurring Deposit"}:
+        answer = f"You can usually close a {product_name} before maturity, but the bank may reduce the interest rate or charge a premature withdrawal penalty. Check the exact terms for your deposit before closing it."
+    elif q_terms & {"maturity", "mature"} and product_name in {"Fixed Deposit", "Recurring Deposit"}:
+        answer = f"At maturity, the {product_name} principal plus applicable interest is credited to your chosen bank account, unless you selected renewal or reinvestment."
+    elif product_name == "Recurring Deposit" and q_terms & {"month", "monthly", "deposit", "amount"}:
+        answer = "In a recurring deposit, you deposit a fixed amount every month for the chosen tenure. The monthly amount is selected when you open the RD."
+    elif q_terms & {"interest", "rate", "returns"} and features.get("Interest"):
+        answer = f"For {product_name}, the interest arrangement is: {features['Interest']}."
+    elif product_name == "Net Banking" and q_terms & {"activate", "activation", "register"}:
+        answer = "To activate net banking, register through your bank's official website or app using your customer ID/account details, verify with OTP or debit card credentials, then set your login password securely."
+    elif q_terms & {"difference", "compare", "versus"} and {"NEFT", "RTGS"} & {product_name}:
+        answer = "NEFT is generally used for regular non-urgent bank transfers, while RTGS is used for higher-value transfers that need faster settlement. Both move money between bank accounts, but RTGS is typically chosen for larger urgent payments."
+    elif intent in {"opening", "documents", "process"} or q_terms & {"open", "opening", "apply", "document", "documents", "proof", "kyc"}:
+        answer = build_form_assistant_answer(product_name.lower(), intent, question)
+    elif q_terms & {"minimum", "balance"} and product_name == "Savings Account":
+        answer = "Minimum balance depends on the specific savings account variant. Some accounts are zero-balance, while regular savings accounts may require an average monthly or quarterly balance."
+    else:
+        structured = build_structured_product_candidate(product_name.lower(), "definition")
+        answer = structured["answer"] if structured else f"{product_name} is a banking service used for {features.get('Best for', 'banking needs').lower()}."
+    source = {
+        "section": "general banking reference",
+        "question": f"What is {product_name}?",
+        "answer": answer,
+        "source": "Structured banking reference",
+        "source_file": "backend/chat_service.py",
+        "dataset": "structured_general_banking",
+        "search_methods": ["structured_general_banking"],
+        "hybrid_score": 100.0,
+    }
+    logger.info(
+        "general_banking.reference product=%s category=%s intent=%s question=%s answer=%s",
+        product_name,
+        category,
+        intent,
+        log_text(question),
+        log_text(answer),
+    )
+    return answer, [source]
+
+
 def build_structured_product_candidate(topic, intent):
     if intent not in {"definition", "general"} or not topic:
         return None
@@ -2282,7 +2395,11 @@ def build_structured_product_candidate(topic, intent):
     best_for = features.get("Best for", "banking needs").rstrip(".")
     typical_use = features.get("Typical use", "").rstrip(".")
     interest = features.get("Interest", "").rstrip(".")
-    answer = f"A {product_name.lower()} is a banking product used for {best_for.lower()}."
+    article = "an" if product_name[:1].lower() in {"a", "e", "i", "o", "u"} else "a"
+    if product_name.isupper() or product_name in {"Net Banking"}:
+        answer = f"{product_name} is a banking service used for {best_for.lower()}."
+    else:
+        answer = f"{article.capitalize()} {product_name.lower()} is a banking product used for {best_for.lower()}."
     if typical_use:
         answer += f" It is commonly used for {typical_use.lower()}."
     if interest:
@@ -2659,6 +2776,24 @@ def answer_message(message, language="English", session_id=None):
     topic = extract_topic_from_question(resolved_question)
     if not topic and is_follow_up_question(search_question):
         topic = session.get("current_topic", "")
+    if (
+        is_follow_up_question(search_question)
+        and should_use_general_banking_reference(session.get("current_topic", ""))
+        and (
+            not topic
+            or not should_use_general_banking_reference(topic)
+            or topic in {"minimum balance", "how much do deposit"}
+        )
+    ):
+        previous_topic = topic
+        topic = session.get("current_topic", "")
+        logger.info(
+            "answer.topic_context_override session_id=%s previous_topic=%s inherited_topic=%s question=%s",
+            session_id,
+            previous_topic or "",
+            topic or "",
+            log_text(search_question),
+        )
     if not topic and session.get("current_topic") and intent in {"dispute", "documents", "fees", "interest", "tenure", "limits", "eligibility", "opening", "process"}:
         topic = session.get("current_topic", "")
         resolved_question = resolve_question_context(f"{search_question} about {topic}", session)
@@ -2780,6 +2915,32 @@ def answer_message(message, language="English", session_id=None):
         }
 
     banking_related = is_banking_related_question(search_question, session)
+
+    if banking_related and should_use_general_banking_reference(topic):
+        logger.info("answer.route general_banking_reference session_id=%s topic=%s intent=%s resolved=%s", session_id, topic or "", intent, log_text(resolved_question))
+        reply, sources = build_general_banking_reference_answer(search_question, topic, intent)
+        reply = translate_answer(reply, language)
+        product_topic = general_banking_product_name(topic) or topic
+        remember_conversation_context(session, product_topic.lower(), intent, resolved_question)
+        if sources:
+            remember_kb_source_context(session, sources[0])
+        response_suggestions = translate_suggested_questions(
+            build_contextual_suggested_questions(None, product_topic.lower(), intent),
+            language,
+        )
+        session["chat_history"].append({"role": "bot", "message": reply})
+        log_answer_return("general_banking_reference", session_id, reply, sources, {"topic": product_topic, "intent": intent})
+        return {
+            "session_id": session_id,
+            "reply": reply,
+            "history": session["chat_history"],
+            "sources": sources[:3],
+            "suggested_questions": response_suggestions,
+            "recommendation_card": None,
+            "topic": product_topic.lower(),
+            "rewritten_question": None,
+            "search_methods": ["structured_general_banking"],
+        }
 
     if LIGHTWEIGHT_MODE and banking_related:
         logger.info("answer.route lightweight_official session_id=%s topic=%s intent=%s resolved=%s", session_id, topic or "", intent, log_text(resolved_question))
