@@ -24,6 +24,7 @@ logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
+logger = logging.getLogger("banking_chatbot.api")
 
 PAGE_LINKS = {
     "login": "/login",
@@ -76,19 +77,24 @@ class BankingChatbotHandler(SimpleHTTPRequestHandler):
         super().end_headers()
 
     def do_OPTIONS(self):
+        logger.info("http.options path=%s client=%s", self.path, self.client_address[0])
         self.send_response(204)
         self.end_headers()
 
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
+        logger.info("http.get path=%s query=%s client=%s", path, parsed.query, self.client_address[0])
         if path == "/api/health":
+            logger.info("http.route endpoint=health method=GET")
             self.send_json({"ok": True, "message": "Banking chatbot backend is running."})
             return
         if path == "/api/token":
+            logger.info("http.route endpoint=token_status method=GET")
             self.handle_token_status()
             return
         if path in {"/api/pages", "/api/buttons", "/api/actions", "/api/links"}:
+            logger.info("http.route endpoint=links method=GET")
             self.send_json({"pages": PAGE_LINKS, "apis": API_LINKS, "buttons": BUTTON_LINKS})
             return
         if path.startswith("/api/pages/"):
@@ -112,6 +118,7 @@ class BankingChatbotHandler(SimpleHTTPRequestHandler):
                 auth_user = self.require_auth()
                 query = parse_qs(parsed.query)
                 user_id = query.get("user_id", [""])[0]
+                logger.info("http.route endpoint=profile method=GET auth_user_id=%s requested_user_id=%s", auth_user["id"], user_id)
                 if str(auth_user["id"]) != str(user_id):
                     self.send_json({"error": "You are not authorized to view this profile."}, status=403)
                     return
@@ -123,7 +130,8 @@ class BankingChatbotHandler(SimpleHTTPRequestHandler):
             return
         if path == "/api/analytics":
             try:
-                self.require_auth()
+                auth_user = self.require_auth()
+                logger.info("http.route endpoint=analytics method=GET auth_user_id=%s", auth_user["id"])
                 self.send_json({"analytics": get_analytics_dashboard()})
             except ValueError as exc:
                 self.send_json({"error": str(exc)}, status=401)
@@ -134,6 +142,12 @@ class BankingChatbotHandler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path.rstrip("/") or "/"
+        logger.info(
+            "http.post path=%s client=%s content_length=%s",
+            path,
+            self.client_address[0],
+            self.headers.get("Content-Length", "0"),
+        )
         if path in {"/api/signup", "/api/signin", "/api/register", "/api/login"}:
             self.handle_auth(path)
             return
@@ -149,6 +163,14 @@ class BankingChatbotHandler(SimpleHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
             message = str(payload.get("message", ""))
             language = str(payload.get("language", "English"))
+            logger.info(
+                "http.chat.start user_id=%s username=%s session_id=%s language=%s message=%s",
+                auth_user["id"],
+                auth_user["username"],
+                payload.get("session_id"),
+                language,
+                " ".join(message.split())[:160],
+            )
             start_time = time.perf_counter()
             result = answer_message(
                 message=message,
@@ -166,10 +188,29 @@ class BankingChatbotHandler(SimpleHTTPRequestHandler):
                 response_time_ms=response_time_ms,
             )
             result["response_time_ms"] = response_time_ms
+            logger.info(
+                "http.chat.done user_id=%s session_id=%s response_time_ms=%s topic=%s methods=%s sources=%s reply_words=%s",
+                auth_user["id"],
+                result.get("session_id"),
+                response_time_ms,
+                result.get("topic"),
+                result.get("search_methods"),
+                [
+                    {
+                        "question": source.get("question", ""),
+                        "score": source.get("hybrid_score", ""),
+                        "methods": source.get("search_methods", []),
+                    }
+                    for source in result.get("sources", [])[:3]
+                ],
+                len(str(result.get("reply", "")).split()),
+            )
             self.send_json(result)
         except ValueError as exc:
+            logger.warning("http.chat.auth_or_value_error path=%s error=%s", path, exc)
             self.send_json({"error": str(exc)}, status=401 if "token" in str(exc).lower() else 400)
         except Exception as exc:
+            logger.exception("http.chat.failed path=%s", path)
             self.send_json({"error": "The chatbot backend failed to answer.", "details": str(exc)}, status=500)
 
     def get_bearer_token(self):
@@ -185,11 +226,14 @@ class BankingChatbotHandler(SimpleHTTPRequestHandler):
         try:
             token = self.get_bearer_token()
             user = self.require_auth()
+            logger.info("auth.token_status ok user_id=%s username=%s", user["id"], user["username"])
             self.send_json({"ok": True, "token": token, "token_type": "Bearer", "user": user})
         except ValueError as exc:
+            logger.warning("auth.token_status failed error=%s", exc)
             self.send_json({"ok": False, "error": str(exc)}, status=401)
 
     def handle_logout(self):
+        logger.info("auth.logout requested has_token=%s", bool(self.get_bearer_token()))
         revoke_auth_token(self.get_bearer_token())
         self.send_json({"ok": True})
 
@@ -199,15 +243,20 @@ class BankingChatbotHandler(SimpleHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
             username = str(payload.get("username", ""))
             password = str(payload.get("password", ""))
+            logger.info("auth.start endpoint=%s username=%s password_present=%s", path, username, bool(password))
             user = signup_user(username, password) if path in {"/api/signup", "/api/register"} else signin_user(username, password)
+            logger.info("auth.done endpoint=%s user_id=%s username=%s", path, user.get("id"), user.get("username"))
             self.send_json({"user": user})
         except ValueError as exc:
+            logger.warning("auth.failed endpoint=%s error=%s", path, exc)
             self.send_json({"error": str(exc)}, status=400)
         except Exception as exc:
+            logger.exception("auth.exception endpoint=%s", path)
             self.send_json({"error": "Authentication failed.", "details": str(exc)}, status=500)
 
     def send_json(self, data, status=200):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        logger.info("http.response status=%s bytes=%s keys=%s", status, len(body), list(data.keys()) if isinstance(data, dict) else [])
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -217,6 +266,7 @@ class BankingChatbotHandler(SimpleHTTPRequestHandler):
     def serve_frontend(self, request_path):
         root = FRONTEND_DIST if FRONTEND_DIST.exists() else FRONTEND_PUBLIC
         file_path = root / "index.html" if request_path in {"", "/"} else (root / request_path.lstrip("/")).resolve()
+        logger.info("frontend.serve request_path=%s root=%s resolved=%s", request_path, root, file_path)
         if root.resolve() not in file_path.parents and file_path != root.resolve():
             self.send_error(403)
             return

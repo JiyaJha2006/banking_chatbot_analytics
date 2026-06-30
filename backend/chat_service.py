@@ -33,6 +33,45 @@ def log_text(value, max_length=160):
     text = " ".join(str(value or "").split())
     return text if len(text) <= max_length else f"{text[:max_length]}..."
 
+
+def log_session_state(session):
+    last_source = session.get("last_kb_source") or {}
+    entity_source = session.get("last_entity_kb_source") or {}
+    return {
+        "history_count": len(session.get("chat_history", [])),
+        "current_topic": session.get("current_topic", ""),
+        "current_intent": session.get("current_intent", "general"),
+        "last_question": log_text(last_source.get("question", ""), 90),
+        "entity_question": log_text(entity_source.get("question", ""), 90),
+        "kb_history_count": len(session.get("kb_source_history", [])),
+        "has_comparison": bool(session.get("last_comparison")),
+        "pending_flow": bool(session.get("pending_flow")),
+    }
+
+
+def log_source_summary(source):
+    if not source:
+        return "none"
+    return (
+        f"section={source.get('section', '')} "
+        f"question={log_text(source.get('question', ''), 90)} "
+        f"file={source.get('source_file', '')} "
+        f"methods={source.get('search_methods', [])} "
+        f"score={source.get('hybrid_score', '')}"
+    )
+
+
+def log_answer_return(route, session_id, reply, sources=None, extra=None):
+    source = sources[0] if isinstance(sources, list) and sources else {}
+    logger.info(
+        "answer.return route=%s session_id=%s reply_words=%s source=%s extra=%s",
+        route,
+        session_id,
+        len(str(reply or "").split()),
+        log_source_summary(source),
+        extra or {},
+    )
+
 BANKING_TOPIC_ALIASES = {
     "savings account": "savings account",
     "saving account": "savings account",
@@ -248,6 +287,7 @@ def ensure_official_banking_collection(client, collection):
 def get_session(session_id=None):
     if not session_id:
         session_id = str(uuid.uuid4())
+    created = session_id not in SESSIONS
     SESSIONS.setdefault(session_id, {
         "chat_history": [],
         "current_topic": "",
@@ -259,6 +299,7 @@ def get_session(session_id=None):
         "kb_source_history": [],
         "last_comparison": {},
     })
+    logger.info("session.get session_id=%s created=%s state=%s", session_id, created, log_session_state(SESSIONS[session_id]))
     return session_id, SESSIONS[session_id]
 
 
@@ -275,8 +316,10 @@ def is_follow_up_question(user_question):
         "should i keep", "records should i keep",
         "same details", "same info", "same information", "as above",
     ]
-    if any(re.search(rf"\b{re.escape(phrase)}\b", q) for phrase in phrases):
-        return True
+    for phrase in phrases:
+        if re.search(rf"\b{re.escape(phrase)}\b", q):
+            logger.info("followup.detect result=true reason=phrase phrase=%s question=%s", phrase, log_text(user_question))
+            return True
     short_follow_up_terms = {
         "late", "interest", "fee", "fees", "charge", "charges", "cashback", "reward",
         "rewards", "points", "documents", "limit", "limits", "online", "next",
@@ -284,12 +327,16 @@ def is_follow_up_question(user_question):
         "waiver", "waived", "miles", "mile", "proof", "record", "records",
         "evidence", "replacement", "replace",
     }
-    if len(q.split()) <= 3 and search_tokens(q) & short_follow_up_terms:
+    short_hits = search_tokens(q) & short_follow_up_terms
+    if len(q.split()) <= 3 and short_hits:
+        logger.info("followup.detect result=true reason=short_terms hits=%s question=%s", sorted(short_hits), log_text(user_question))
         return True
     intent = detect_question_intent(q)
-    return len(q.split()) <= 7 and intent in {
+    decision = len(q.split()) <= 7 and intent in {
         "documents", "fees", "interest", "tenure", "limits", "eligibility", "opening", "process", "dispute"
     }
+    logger.info("followup.detect result=%s reason=intent intent=%s question=%s", decision, intent, log_text(user_question))
+    return decision
 
 
 def build_recent_chat_history(session):
@@ -437,8 +484,11 @@ def detect_question_intent(question):
         ("definition", ["what is", "what are", "meaning", "define", "explain", "tell me about"]),
     ]
     for intent, phrases in intent_rules:
-        if any(phrase in q for phrase in phrases):
-            return intent
+        for phrase in phrases:
+            if phrase in q:
+                logger.info("intent.detect intent=%s phrase=%s question=%s", intent, phrase, log_text(question))
+                return intent
+    logger.info("intent.detect intent=general question=%s", log_text(question))
     return "general"
 
 
@@ -722,10 +772,14 @@ def extract_topic_from_question(user_question):
     text = " ".join(text.split())
     for alias in sorted(BANKING_TOPIC_ALIASES, key=len, reverse=True):
         if re.search(rf"\b{re.escape(alias)}\b", text):
-            return BANKING_TOPIC_ALIASES[alias]
+            topic = BANKING_TOPIC_ALIASES[alias]
+            logger.info("topic.extract result=%s reason=banking_alias alias=%s question=%s", topic, alias, log_text(user_question))
+            return topic
     for alias, product in sorted(PRODUCT_ALIASES.items(), key=lambda item: len(item[0]), reverse=True):
         if product != "Credit Card" and re.search(rf"\b{re.escape(alias)}\b", text):
-            return product.lower()
+            topic = product.lower()
+            logger.info("topic.extract result=%s reason=product_alias alias=%s question=%s", topic, alias, log_text(user_question))
+            return topic
 
     remove_phrases = [
         "what is", "what are", "how can i", "how do i", "how to", "help me",
@@ -742,6 +796,7 @@ def extract_topic_from_question(user_question):
         "you", "your", "it", "this", "that", "please", "with", "and", "or",
     }]
     if not words:
+        logger.info("topic.extract result=none reason=no_words question=%s", log_text(user_question))
         return ""
 
     domain_nouns = {
@@ -754,7 +809,14 @@ def extract_topic_from_question(user_question):
         if word in domain_nouns:
             start = max(0, index - 3)
             candidates.append(" ".join(words[start:index + 1]))
-    return max(candidates, key=len) if candidates else ""
+    topic = max(candidates, key=len) if candidates else ""
+    logger.info(
+        "topic.extract result=%s reason=%s question=%s",
+        topic or "none",
+        "domain_noun" if topic else "no_candidate",
+        log_text(user_question),
+    )
+    return topic
 
 
 def normalize_banking_spelling(question):
@@ -770,7 +832,12 @@ def normalize_banking_spelling(question):
             continue
         match = get_close_matches(token, vocabulary, n=1, cutoff=0.78)
         corrected.append(match[0] if match else token)
-    return "".join(corrected).strip()
+    normalized = "".join(corrected).strip()
+    if normalized != question.lower().strip():
+        logger.info("normalize.spelling changed original=%s normalized=%s", log_text(question), log_text(normalized))
+    else:
+        logger.info("normalize.spelling unchanged question=%s", log_text(question))
+    return normalized
 
 
 def question_clarity_score(question, session):
@@ -797,24 +864,41 @@ def question_needs_llm_rewrite(question, session):
 
 def is_banking_related_question(question, session):
     text = question.lower().strip()
-    if extract_topic_from_question(text):
+    topic = extract_topic_from_question(text)
+    if topic:
+        logger.info("banking.detect result=true reason=topic topic=%s question=%s", topic, log_text(question))
         return True
     words = set(re.findall(r"[a-z0-9]+", text))
-    if words & BANKING_VOCABULARY:
+    vocab_hits = words & BANKING_VOCABULARY
+    if vocab_hits:
+        logger.info("banking.detect result=true reason=vocabulary hits=%s question=%s", sorted(vocab_hits), log_text(question))
         return True
     banking_phrases = {
         "credit score", "bank account", "send money", "receive money",
         "save money", "borrow money", "monthly instalment", "monthly installment",
         "account number", "routing number", "ifsc code",
     }
-    if any(phrase in text for phrase in banking_phrases):
-        return True
+    for phrase in banking_phrases:
+        if phrase in text:
+            logger.info("banking.detect result=true reason=phrase phrase=%s question=%s", phrase, log_text(question))
+            return True
     if session.get("last_comparison") and answer_comparison_followup(text, session):
+        logger.info("banking.detect result=true reason=comparison_followup question=%s", log_text(question))
         return True
-    return bool(
-        is_follow_up_question(text)
-        and (session.get("current_topic") or session.get("last_kb_source") or session.get("kb_source_history"))
+    follow_up = is_follow_up_question(text)
+    has_context = bool(session.get("current_topic") or session.get("last_kb_source") or session.get("kb_source_history"))
+    decision = bool(
+        follow_up and has_context
     )
+    logger.info(
+        "banking.detect result=%s reason=session_followup follow_up=%s has_context=%s question=%s state=%s",
+        decision,
+        follow_up,
+        has_context,
+        log_text(question),
+        log_session_state(session),
+    )
+    return decision
 
 
 def is_general_factual_question(message):
@@ -1287,11 +1371,24 @@ def build_previous_answer_candidate(current_query, previous_source):
     answer = str(previous_source.get("answer", ""))
     query_terms = expand_query_terms(current_query)
     if not answer or not query_terms:
+        logger.info(
+            "previous_answer.skip reason=no_answer_or_terms query=%s source=%s",
+            log_text(current_query),
+            log_source_summary(previous_source),
+        )
         return None
     previous_terms = search_tokens(f"{previous_source.get('question', '')} {answer}")
+    logger.info(
+        "previous_answer.start query=%s query_terms=%s source=%s",
+        log_text(current_query),
+        sorted(query_terms),
+        log_source_summary(previous_source),
+    )
     if query_terms & {"investigation", "chargeback"} and not (previous_terms & {"investigation", "chargeback", "provisional", "temporary"}):
+        logger.info("previous_answer.skip reason=missing_investigation_context query=%s source=%s", log_text(current_query), log_source_summary(previous_source))
         return None
     if query_terms & {"merchant", "valid", "prove"} and not (previous_terms & {"chargeback", "legitimate", "reversed", "temporary", "provisional"}):
+        logger.info("previous_answer.skip reason=missing_merchant_context query=%s source=%s", log_text(current_query), log_source_summary(previous_source))
         return None
 
     ranked_units = []
@@ -1331,11 +1428,28 @@ def build_previous_answer_candidate(current_query, previous_source):
         ranked_units.append((score, index, unit))
 
     if not ranked_units:
+        logger.info("previous_answer.skip reason=no_ranked_units query=%s source=%s", log_text(current_query), log_source_summary(previous_source))
         return None
     ranked_units.sort(key=lambda item: item[0], reverse=True)
+    for rank, (score, index, unit) in enumerate(ranked_units[:5], 1):
+        logger.info(
+            "previous_answer.unit_candidate rank=%s score=%.4f unit_index=%s heading=%s text=%s",
+            rank,
+            score,
+            index,
+            log_text(unit.get("heading", ""), 80),
+            log_text(unit.get("text", ""), 140),
+        )
     best_score = ranked_units[0][0]
     min_score = 4.0 if temporal_query or is_product_attribute_followup(current_query) else 9.0
     if best_score < min_score:
+        logger.info(
+            "previous_answer.skip reason=below_min_score best_score=%.4f min_score=%.4f query=%s source=%s",
+            best_score,
+            min_score,
+            log_text(current_query),
+            log_source_summary(previous_source),
+        )
         return None
 
     selected_indexes = sorted(index for _, index, _ in ranked_units[:4])
@@ -1351,6 +1465,7 @@ def build_previous_answer_candidate(current_query, previous_source):
         lines.append(unit["text"])
     snippet = "\n".join(lines).strip()
     if not snippet:
+        logger.info("previous_answer.skip reason=empty_snippet query=%s source=%s", log_text(current_query), log_source_summary(previous_source))
         return None
 
     context_bonus = 60.0 if temporal_query else 20.0 if len(query_terms) == 1 else 45.0
@@ -1358,6 +1473,13 @@ def build_previous_answer_candidate(current_query, previous_source):
         context_bonus += 35.0
     if query_terms & {"limit", "limits"} and query_terms & {"change", "carry", "replacement"} and search_tokens(answer) & {"limit", "limits", "carry", "restored"}:
         context_bonus += 55.0
+    logger.info(
+        "previous_answer.selected score=%.4f context_bonus=%.4f selected_indexes=%s snippet=%s",
+        best_score + context_bonus,
+        context_bonus,
+        selected_indexes,
+        log_text(snippet, 220),
+    )
     return {
         "score": round(best_score + context_bonus, 4),
         "metadata": {
@@ -1667,6 +1789,13 @@ def retrieve_lightweight_official_answer(query, topic="", intent="general", sess
     contextual_query = build_contextual_retrieval_query(current_query, session) if (follow_up or product_attribute_context) else current_query
     query_terms = search_tokens(current_query)
     logger.info(
+        "retrieve.official.context product_attribute_context=%s query_terms=%s entity_source=%s session_state=%s",
+        product_attribute_context,
+        sorted(query_terms),
+        log_source_summary(entity_source),
+        log_session_state(session),
+    )
+    logger.info(
         "retrieve.official.start query=%s current_query=%s contextual_query=%s topic=%s intent=%s follow_up=%s documents=%s previous_section=%s previous_question=%s previous_source_file=%s",
         log_text(query),
         log_text(current_query),
@@ -1758,12 +1887,13 @@ def retrieve_lightweight_official_answer(query, topic="", intent="general", sess
     ranked.sort(key=lambda item: item[0], reverse=True)
     for rank, (score, metadata) in enumerate(ranked[:5], 1):
         logger.info(
-            "retrieve.official.candidate rank=%s score=%.4f section=%s question=%s source_file=%s",
+            "retrieve.official.candidate rank=%s score=%.4f section=%s question=%s source_file=%s answer=%s",
             rank,
             score,
             metadata.get("section", ""),
             log_text(metadata.get("question", "")),
             metadata.get("source_file", ""),
+            log_text(metadata.get("answer", ""), 180),
         )
 
     if not ranked:
@@ -1931,19 +2061,32 @@ def choose_best_answer(user_question, banking_context, reranker_model, intent="g
 
 def translate_question_for_search(question, language):
     if language == "English":
+        logger.info("translate.question skip language=English question=%s", log_text(question))
         return question
     try:
-        return GoogleTranslator(source="auto", target="en").translate(question)
-    except Exception:
+        translated = GoogleTranslator(source="auto", target="en").translate(question)
+        logger.info("translate.question success language=%s original=%s translated=%s", language, log_text(question), log_text(translated))
+        return translated
+    except Exception as exc:
+        logger.warning("translate.question failed language=%s question=%s error=%s", language, log_text(question), exc)
         return question
 
 
 def translate_answer(answer, language):
     if language == "English":
+        logger.info("translate.answer skip language=English answer_words=%s", len(str(answer or "").split()))
         return answer
     try:
-        return GoogleTranslator(source="auto", target="hi").translate(answer)
-    except Exception:
+        translated = GoogleTranslator(source="auto", target="hi").translate(answer)
+        logger.info(
+            "translate.answer success language=%s original_words=%s translated_words=%s",
+            language,
+            len(str(answer or "").split()),
+            len(str(translated or "").split()),
+        )
+        return translated
+    except Exception as exc:
+        logger.warning("translate.answer failed language=%s answer_words=%s error=%s", language, len(str(answer or "").split()), exc)
         return answer
 
 
@@ -2098,6 +2241,7 @@ def build_structured_product_candidate(topic, intent):
 def detect_compare_products(question):
     q = question.lower()
     if not any(word in q for word in ["compare", "difference", "versus", " vs ", "better"]):
+        logger.info("comparison.detect result=none reason=no_compare_cue question=%s", log_text(question))
         return []
     matches = []
     for alias, product in sorted(PRODUCT_ALIASES.items(), key=lambda item: len(item[0]), reverse=True):
@@ -2110,12 +2254,15 @@ def detect_compare_products(question):
     for _, _, product in sorted(matches):
         if product not in ordered:
             ordered.append(product)
-    return ordered[:2] if len(ordered) >= 2 else []
+    products = ordered[:2] if len(ordered) >= 2 else []
+    logger.info("comparison.detect result=%s question=%s", products, log_text(question))
+    return products
 
 
 def compare_products(question):
     products = detect_compare_products(question)
     if len(products) < 2:
+        logger.info("comparison.create skip reason=not_enough_products products=%s question=%s", products, log_text(question))
         return None
     feature_order = ["Fee", "Rewards", "Deposit", "Interest", "Best for", "Flexibility", "Typical use"]
     features = [
@@ -2131,6 +2278,7 @@ def compare_products(question):
         for feature in features
     ]
     reply = f"Here is a simple comparison of {products[0]} and {products[1]}:"
+    logger.info("comparison.create products=%s rows=%s topic=%s", products, len(rows), f"{products[0]} vs {products[1]}")
     return {
         "reply": reply,
         "comparison_table": {
@@ -2171,9 +2319,11 @@ def is_product_attribute_followup(question):
 def answer_comparison_followup(question, session):
     table = session.get("last_comparison") or {}
     if not table:
+        logger.info("comparison.followup skip reason=no_table question=%s", log_text(question))
         return None
     q_terms = expand_query_terms(question)
     if not q_terms:
+        logger.info("comparison.followup skip reason=no_terms question=%s", log_text(question))
         return None
     q_text = str(question or "").lower()
     comparison_cues = {
@@ -2186,10 +2336,12 @@ def answer_comparison_followup(question, session):
         "of these", "these two", "the first", "the second", "both cards",
     ]
     if not ((q_terms & comparison_cues) or any(phrase in q_text for phrase in comparison_phrases)):
+        logger.info("comparison.followup skip reason=no_comparison_cue q_terms=%s question=%s", sorted(q_terms), log_text(question))
         return None
     columns = table.get("columns") or []
     rows = table.get("rows") or []
     if len(columns) < 3 or not rows:
+        logger.info("comparison.followup skip reason=invalid_table columns=%s rows=%s question=%s", columns, len(rows), log_text(question))
         return None
 
     ranked_rows = []
@@ -2219,6 +2371,7 @@ def answer_comparison_followup(question, session):
                 ranked_rows.append((1, str(row.get("feature", "")), row))
                 break
     if not ranked_rows:
+        logger.info("comparison.followup skip reason=no_row_match q_terms=%s table_title=%s question=%s", sorted(q_terms), table.get("title", ""), log_text(question))
         return None
     ranked_rows.sort(key=lambda item: item[0], reverse=True)
     _, feature, row = ranked_rows[0]
@@ -2236,6 +2389,14 @@ def answer_comparison_followup(question, session):
         answer = f"For travel use, compare the '{feature}' row: {left}: {left_value}. {right}: {right_value}."
     else:
         answer = f"For {feature.lower()}, {left}: {left_value}. {right}: {right_value}."
+    logger.info(
+        "comparison.followup selected table=%s feature=%s left=%s right=%s answer=%s",
+        table.get("title", ""),
+        feature,
+        left,
+        right,
+        log_text(answer),
+    )
     return answer
 
 
@@ -2267,6 +2428,7 @@ def extract_account_profile(question):
 
 def recommend_account(question):
     signals = extract_account_profile(question)
+    logger.info("recommend.profile signals=%s question=%s", signals, log_text(question))
     options = [
         {
             "account": "Student Savings Account",
@@ -2326,6 +2488,7 @@ def recommend_account(question):
         ranked[0] = next(option for option in ranked if option["account"] == "Regular Savings Account")
 
     best = ranked[0]
+    logger.info("recommend.selected account=%s score=%s benefits=%s", best["account"], best.get("score", 0), best.get("benefits", []))
     detected = [name.replace("_", " ") for name in signals]
     card = {
         "title": "Recommended account",
@@ -2415,6 +2578,7 @@ def answer_message(message, language="English", session_id=None):
         reply = build_sensitive_personal_refusal(language)
         session["chat_history"].append({"role": "user", "message": message})
         session["chat_history"].append({"role": "bot", "message": reply})
+        log_answer_return("privacy_guard", session_id, reply, [], {"restricted": True})
         return {
             "session_id": session_id,
             "reply": reply,
@@ -2467,6 +2631,7 @@ def answer_message(message, language="English", session_id=None):
         reply = build_credential_help_answer(search_question, language)
         remember_conversation_context(session, "banking password" if "password" in search_question else "banking PIN", "process", resolved_question)
         session["chat_history"].append({"role": "bot", "message": reply})
+        log_answer_return("credential_help", session_id, reply, [], {"topic": "banking password" if "password" in search_question else "banking PIN"})
         return {
             "session_id": session_id,
             "reply": reply,
@@ -2487,6 +2652,7 @@ def answer_message(message, language="English", session_id=None):
         remember_conversation_context(session, comparison["topic"], "comparison", comparison["topic"])
         session["last_comparison"] = comparison["comparison_table"]
         session["chat_history"].append({"role": "bot", "message": reply})
+        log_answer_return("comparison", session_id, reply, [], {"topic": comparison["topic"], "table": comparison["comparison_table"]["title"]})
         return {
             "session_id": session_id,
             "reply": reply,
@@ -2508,6 +2674,7 @@ def answer_message(message, language="English", session_id=None):
         recommendation_topic = recommendation_card.get("account", "account recommendation")
         remember_conversation_context(session, recommendation_topic, "recommendation", search_question)
         session["chat_history"].append({"role": "bot", "message": reply})
+        log_answer_return("recommendation", session_id, reply, [], {"topic": recommendation_topic, "card": recommendation_card})
         return {
             "session_id": session_id,
             "reply": reply,
@@ -2527,6 +2694,7 @@ def answer_message(message, language="English", session_id=None):
         logger.info("answer.route comparison_followup session_id=%s question=%s", session_id, log_text(search_question))
         reply = translate_answer(comparison_followup, language)
         session["chat_history"].append({"role": "bot", "message": reply})
+        log_answer_return("comparison_followup", session_id, reply, [], {"topic": session.get("current_topic", "")})
         return {
             "session_id": session_id,
             "reply": reply,
@@ -2545,6 +2713,7 @@ def answer_message(message, language="English", session_id=None):
         reply = translate_answer(pending_reply, language)
         remember_conversation_context(session, response_topic, intent, resolved_question)
         session["chat_history"].append({"role": "bot", "message": reply})
+        log_answer_return("pending_flow", session_id, reply, [], {"topic": response_topic, "intent": intent})
         return {
             "session_id": session_id,
             "reply": reply,
@@ -2575,6 +2744,7 @@ def answer_message(message, language="English", session_id=None):
             language,
         )
         session["chat_history"].append({"role": "bot", "message": reply})
+        log_answer_return("lightweight_official", session_id, reply, sources, {"topic": topic, "intent": intent})
         return {
             "session_id": session_id,
             "reply": reply,
@@ -2597,6 +2767,7 @@ def answer_message(message, language="English", session_id=None):
         reply = translate_answer(clarifying_reply, language)
         remember_conversation_context(session, topic, intent, resolved_question)
         session["chat_history"].append({"role": "bot", "message": reply})
+        log_answer_return("clarifying_question", session_id, reply, [], {"topic": topic, "intent": intent})
         return {
             "session_id": session_id,
             "reply": reply,
@@ -2612,6 +2783,7 @@ def answer_message(message, language="English", session_id=None):
         reply = translate_answer(reply, language)
         remember_conversation_context(session, topic, intent, resolved_question)
         session["chat_history"].append({"role": "bot", "message": reply})
+        log_answer_return("form_assistant", session_id, reply, [], {"topic": topic, "intent": intent})
         return {
             "session_id": session_id,
             "reply": reply,
@@ -2626,6 +2798,7 @@ def answer_message(message, language="English", session_id=None):
             logger.info("answer.route lightweight_general session_id=%s question=%s", session_id, log_text(message))
             reply, general_methods = build_general_reference_answer(message, language)
             session["chat_history"].append({"role": "bot", "message": reply})
+            log_answer_return("lightweight_general", session_id, reply, [], {"methods": general_methods})
             return {
                 "session_id": session_id,
                 "reply": reply,
@@ -2653,6 +2826,7 @@ def answer_message(message, language="English", session_id=None):
         else:
             reply, general_methods = build_general_reference_answer(message, language)
         session["chat_history"].append({"role": "bot", "message": reply})
+        log_answer_return("general", session_id, reply, [], {"methods": general_methods})
         return {
             "session_id": session_id,
             "reply": reply,
@@ -2683,6 +2857,7 @@ def answer_message(message, language="English", session_id=None):
             language,
         )
         session["chat_history"].append({"role": "bot", "message": reply})
+        log_answer_return("lightweight_official", session_id, reply, sources, {"topic": topic, "intent": intent})
         return {
             "session_id": session_id,
             "reply": reply,
@@ -2712,6 +2887,7 @@ def answer_message(message, language="English", session_id=None):
         reply = translate_answer(reply, language)
         remember_conversation_context(session, topic, intent, resolved_question)
         session["chat_history"].append({"role": "bot", "message": reply})
+        log_answer_return("chroma_lightweight_fallback", session_id, reply, sources, {"topic": topic, "intent": intent})
         return {
             "session_id": session_id,
             "reply": reply,
@@ -2737,6 +2913,7 @@ def answer_message(message, language="English", session_id=None):
             logger.info("answer.route clarification_after_rewrite session_id=%s resolved=%s", session_id, log_text(resolved_question))
             reply = translate_answer(build_clarification_reply(session), language)
             session["chat_history"].append({"role": "bot", "message": reply})
+            log_answer_return("clarification_after_rewrite", session_id, reply, [], {"topic": session.get("current_topic", "")})
             return {
                 "session_id": session_id,
                 "reply": reply,
@@ -2807,6 +2984,7 @@ def answer_message(message, language="English", session_id=None):
         for method in source.get("search_methods", [])
     } | {"cross_encoder"})
 
+    log_answer_return("llm_rag_or_exact", session_id, reply, sources, {"topic": topic, "intent": intent, "methods": used_search_methods})
     return {
         "session_id": session_id,
         "reply": reply,
