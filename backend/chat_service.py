@@ -210,6 +210,18 @@ def build_sensitive_personal_refusal(language="English"):
     )
 
 
+def build_non_banking_refusal(language="English"):
+    if language == "Hindi":
+        return (
+            "Main sirf banking se related questions ka answer de sakta hoon. "
+            "Kripya bank account, credit card, FD/RD, UPI, loans, payments, fraud, fees, ya RBI rules se related question poochhein."
+        )
+    return (
+        "I can only answer banking-related questions. "
+        "Please ask about bank accounts, credit cards, FD/RD, UPI, loans, payments, fraud, fees, or RBI rules."
+    )
+
+
 @lru_cache(maxsize=1)
 def load_models():
     global MODEL_BUNDLE
@@ -3011,48 +3023,25 @@ def answer_message(message, language="English", session_id=None):
         }
 
     if not banking_related:
-        if LIGHTWEIGHT_MODE:
-            logger.info("answer.route lightweight_general session_id=%s question=%s", session_id, log_text(message))
-            reply, general_methods = build_general_reference_answer(message, language)
-            session["chat_history"].append({"role": "bot", "message": reply})
-            log_answer_return("lightweight_general", session_id, reply, [], {"methods": general_methods})
-            return {
-                "session_id": session_id,
-                "reply": reply,
-                "history": session["chat_history"],
-                "sources": [],
-                "suggested_questions": translate_suggested_questions(build_suggested_questions(), language),
-                "topic": "general conversation",
-                "general_chat": True,
-                "search_methods": general_methods,
-            }
-        ready_models = get_ready_models()
-        logger.info("answer.route general session_id=%s ready_models=%s", session_id, ready_models is not None)
-        if ready_models is not None:
-            try:
-                _, _, tokenizer, llm_model = ready_models
-                reply, general_methods = generate_general_llm_response(
-                    message,
-                    session,
-                    tokenizer,
-                    llm_model,
-                    language,
-                )
-            except Exception:
-                reply, general_methods = build_general_reference_answer(message, language)
-        else:
-            reply, general_methods = build_general_reference_answer(message, language)
+        logger.info("answer.route banking_scope_guard session_id=%s question=%s", session_id, log_text(message))
+        reply = build_non_banking_refusal(language)
         session["chat_history"].append({"role": "bot", "message": reply})
-        log_answer_return("general", session_id, reply, [], {"methods": general_methods})
+        suggestions = translate_suggested_questions([
+            "What is FD?",
+            "How do I report card fraud?",
+            "How do I activate net banking?",
+        ], language)
+        log_answer_return("banking_scope_guard", session_id, reply, [], {"restricted": True})
         return {
             "session_id": session_id,
             "reply": reply,
             "history": session["chat_history"],
             "sources": [],
-            "suggested_questions": translate_suggested_questions(build_suggested_questions(), language),
-            "topic": "general conversation",
-            "general_chat": True,
-            "search_methods": general_methods,
+            "suggested_questions": suggestions,
+            "topic": "banking scope restriction",
+            "restricted": True,
+            "general_chat": False,
+            "search_methods": ["banking_scope_guard"],
         }
 
     if LIGHTWEIGHT_MODE:
