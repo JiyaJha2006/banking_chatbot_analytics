@@ -1,10 +1,14 @@
 ﻿from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import uuid
 import re
+import time
+from collections import OrderedDict
+from copy import deepcopy
 from difflib import SequenceMatcher, get_close_matches
 from functools import lru_cache
 from pathlib import Path
@@ -26,6 +30,10 @@ SESSIONS = {}
 BANKING_METADATA_CACHE = {"count": -1, "metadatas": []}
 MODEL_BUNDLE = None
 LIGHTWEIGHT_MODE = os.getenv("LIGHTWEIGHT_MODE", "0").lower() in {"1", "true", "yes"}
+RESPONSE_CACHE = OrderedDict()
+RESPONSE_CACHE_ENABLED = os.getenv("RESPONSE_CACHE_ENABLED", "1").lower() in {"1", "true", "yes"}
+RESPONSE_CACHE_MAX_SIZE = int(os.getenv("RESPONSE_CACHE_MAX_SIZE", "256"))
+RESPONSE_CACHE_TTL_SECONDS = int(os.getenv("RESPONSE_CACHE_TTL_SECONDS", "900"))
 logger = logging.getLogger("banking_chatbot.chat")
 
 
@@ -71,6 +79,107 @@ def log_answer_return(route, session_id, reply, sources=None, extra=None):
         log_source_summary(source),
         extra or {},
     )
+
+
+CACHE_SESSION_FIELDS = [
+    "current_topic",
+    "current_intent",
+    "topic_history",
+    "last_resolved_question",
+    "last_kb_source",
+    "last_entity_kb_source",
+    "kb_source_history",
+    "last_comparison",
+    "pending_flow",
+]
+
+
+def snapshot_session_context(session):
+    return {field: deepcopy(session.get(field)) for field in CACHE_SESSION_FIELDS}
+
+
+def restore_session_context(session, snapshot):
+    for field, value in (snapshot or {}).items():
+        if value is None:
+            session.pop(field, None)
+        else:
+            session[field] = deepcopy(value)
+
+
+def build_response_cache_key(language, search_question, resolved_question, topic, intent, session, follow_up):
+    last_source = session.get("last_kb_source") or {}
+    comparison = session.get("last_comparison") or {}
+    key_parts = {
+        "language": language,
+        "search_question": normalize_match_text(search_question),
+        "resolved_question": normalize_match_text(resolved_question),
+        "topic": normalize_topic_label(topic or "").lower(),
+        "intent": intent or "general",
+        "follow_up": bool(follow_up),
+        "current_topic": normalize_topic_label(session.get("current_topic", "")).lower(),
+        "current_intent": session.get("current_intent", "general"),
+        "last_source_question": normalize_match_text(last_source.get("question", "")),
+        "last_source_file": last_source.get("source_file", ""),
+        "comparison_title": comparison.get("title", ""),
+        "lightweight": LIGHTWEIGHT_MODE,
+    }
+    raw_key = json.dumps(key_parts, sort_keys=True, ensure_ascii=False)
+    key_id = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()[:16]
+    logger.info(
+        "cache.key key=%s follow_up=%s topic=%s intent=%s current_topic=%s source=%s",
+        key_id,
+        bool(follow_up),
+        key_parts["topic"],
+        key_parts["intent"],
+        key_parts["current_topic"],
+        log_text(last_source.get("question", ""), 70),
+    )
+    return raw_key, key_id
+
+
+def get_cached_response(cache_key, key_id):
+    if not RESPONSE_CACHE_ENABLED:
+        logger.info("cache.disabled key=%s", key_id)
+        return None
+    entry = RESPONSE_CACHE.get(cache_key)
+    if not entry:
+        logger.info("cache.miss key=%s", key_id)
+        return None
+    age = time.time() - entry["created_at"]
+    if age > RESPONSE_CACHE_TTL_SECONDS:
+        RESPONSE_CACHE.pop(cache_key, None)
+        logger.info("cache.expired key=%s age_seconds=%.2f ttl_seconds=%s", key_id, age, RESPONSE_CACHE_TTL_SECONDS)
+        return None
+    RESPONSE_CACHE.move_to_end(cache_key)
+    logger.info("cache.hit key=%s age_seconds=%.2f route=%s", key_id, age, entry.get("route", ""))
+    return deepcopy(entry)
+
+
+def store_response_cache(cache_key, key_id, result, session, route):
+    if not RESPONSE_CACHE_ENABLED:
+        return
+    if not isinstance(result, dict):
+        logger.info("cache.skip key=%s route=%s reason=non_dict_result", key_id, route)
+        return
+    if result.get("restricted") or result.get("needs_clarification") or result.get("recommendation_card"):
+        logger.info("cache.skip key=%s route=%s reason=stateful_or_restricted", key_id, route)
+        return
+
+    payload = deepcopy(result)
+    payload.pop("history", None)
+    payload.pop("session_id", None)
+    payload.pop("response_time_ms", None)
+    RESPONSE_CACHE[cache_key] = {
+        "created_at": time.time(),
+        "route": route,
+        "payload": payload,
+        "context": snapshot_session_context(session),
+    }
+    RESPONSE_CACHE.move_to_end(cache_key)
+    logger.info("cache.store key=%s route=%s size=%s ttl_seconds=%s", key_id, route, len(RESPONSE_CACHE), RESPONSE_CACHE_TTL_SECONDS)
+    while len(RESPONSE_CACHE) > RESPONSE_CACHE_MAX_SIZE:
+        _, evicted = RESPONSE_CACHE.popitem(last=False)
+        logger.info("cache.evict route=%s size=%s max_size=%s", evicted.get("route", ""), len(RESPONSE_CACHE), RESPONSE_CACHE_MAX_SIZE)
 
 BANKING_TOPIC_ALIASES = {
     "savings account": "savings account",
@@ -2782,14 +2891,15 @@ def answer_message(message, language="English", session_id=None):
     translated_question = translate_question_for_search(message, language)
     search_question = normalize_banking_spelling(translated_question)
     resolved_question = resolve_question_context(search_question, session)
+    follow_up = is_follow_up_question(search_question)
     intent = detect_question_intent(resolved_question)
-    if intent == "general" and is_follow_up_question(search_question):
+    if intent == "general" and follow_up:
         intent = session.get("current_intent", "general")
     topic = extract_topic_from_question(resolved_question)
-    if not topic and is_follow_up_question(search_question):
+    if not topic and follow_up:
         topic = session.get("current_topic", "")
     if (
-        is_follow_up_question(search_question)
+        follow_up
         and should_use_general_banking_reference(session.get("current_topic", ""))
         and (
             not topic
@@ -2822,20 +2932,36 @@ def answer_message(message, language="English", session_id=None):
         log_text(translated_question),
         log_text(search_question),
         log_text(resolved_question),
-        is_follow_up_question(search_question),
+        follow_up,
         intent,
         topic or "",
         session.get("current_topic", ""),
         session.get("topic_history", []),
     )
     session["chat_history"].append({"role": "user", "message": message})
+    cache_key, cache_key_id = build_response_cache_key(language, search_question, resolved_question, topic, intent, session, follow_up)
+    cached_response = get_cached_response(cache_key, cache_key_id)
+    if cached_response:
+        restore_session_context(session, cached_response.get("context", {}))
+        result = deepcopy(cached_response["payload"])
+        reply = result.get("reply", "")
+        session["chat_history"].append({"role": "bot", "message": reply})
+        result["session_id"] = session_id
+        result["history"] = session["chat_history"]
+        result["cached"] = True
+        log_answer_return("cache_hit", session_id, reply, result.get("sources", []), {"cache_key": cache_key_id, "route": cached_response.get("route", "")})
+        return result
+
+    def finalize(result, route):
+        store_response_cache(cache_key, cache_key_id, result, session, route)
+        return result
     if is_credential_help_question(search_question):
         logger.info("answer.route credential_help session_id=%s topic=%s intent=%s", session_id, topic or "", intent)
         reply = build_credential_help_answer(search_question, language)
         remember_conversation_context(session, "banking password" if "password" in search_question else "banking PIN", "process", resolved_question)
         session["chat_history"].append({"role": "bot", "message": reply})
         log_answer_return("credential_help", session_id, reply, [], {"topic": "banking password" if "password" in search_question else "banking PIN"})
-        return {
+        return finalize({
             "session_id": session_id,
             "reply": reply,
             "history": session["chat_history"],
@@ -2843,7 +2969,7 @@ def answer_message(message, language="English", session_id=None):
             "suggested_questions": build_credential_help_suggestions(language),
             "topic": "banking password" if "password" in search_question else "banking PIN",
             "search_methods": ["credential_help"],
-        }
+        }, "credential_help")
 
     pending_flow_topic = (session.get("pending_flow") or {}).get("topic", "")
     suggested_questions = translate_suggested_questions(build_suggested_questions(topic, intent), language)
@@ -2856,7 +2982,7 @@ def answer_message(message, language="English", session_id=None):
         session["last_comparison"] = comparison["comparison_table"]
         session["chat_history"].append({"role": "bot", "message": reply})
         log_answer_return("comparison", session_id, reply, [], {"topic": comparison["topic"], "table": comparison["comparison_table"]["title"]})
-        return {
+        return finalize({
             "session_id": session_id,
             "reply": reply,
             "history": session["chat_history"],
@@ -2868,7 +2994,7 @@ def answer_message(message, language="English", session_id=None):
             ], language),
             "comparison_table": comparison["comparison_table"],
             "topic": comparison["topic"],
-        }
+        }, "comparison")
 
     if is_account_recommendation_question(search_question):
         logger.info("answer.route recommendation session_id=%s question=%s", session_id, log_text(search_question))
@@ -2878,7 +3004,7 @@ def answer_message(message, language="English", session_id=None):
         remember_conversation_context(session, recommendation_topic, "recommendation", search_question)
         session["chat_history"].append({"role": "bot", "message": reply})
         log_answer_return("recommendation", session_id, reply, [], {"topic": recommendation_topic, "card": recommendation_card})
-        return {
+        return finalize({
             "session_id": session_id,
             "reply": reply,
             "history": session["chat_history"],
@@ -2890,7 +3016,7 @@ def answer_message(message, language="English", session_id=None):
             ], language),
             "recommendation_card": recommendation_card,
             "topic": recommendation_topic,
-        }
+        }, "recommendation")
 
     comparison_followup = answer_comparison_followup(search_question, session)
     if comparison_followup:
@@ -2898,7 +3024,7 @@ def answer_message(message, language="English", session_id=None):
         reply = translate_answer(comparison_followup, language)
         session["chat_history"].append({"role": "bot", "message": reply})
         log_answer_return("comparison_followup", session_id, reply, [], {"topic": session.get("current_topic", "")})
-        return {
+        return finalize({
             "session_id": session_id,
             "reply": reply,
             "history": session["chat_history"],
@@ -2906,7 +3032,7 @@ def answer_message(message, language="English", session_id=None):
             "suggested_questions": suggested_questions,
             "topic": session.get("current_topic", ""),
             "search_methods": ["comparison_context"],
-        }
+        }, "comparison_followup")
 
     pending_reply = handle_pending_flow(search_question, session)
     if pending_reply:
@@ -2917,14 +3043,14 @@ def answer_message(message, language="English", session_id=None):
         remember_conversation_context(session, response_topic, intent, resolved_question)
         session["chat_history"].append({"role": "bot", "message": reply})
         log_answer_return("pending_flow", session_id, reply, [], {"topic": response_topic, "intent": intent})
-        return {
+        return finalize({
             "session_id": session_id,
             "reply": reply,
             "history": session["chat_history"],
             "sources": [],
             "suggested_questions": response_suggestions,
             "topic": response_topic,
-        }
+        }, "pending_flow")
 
     banking_related = is_banking_related_question(search_question, session)
 
@@ -2942,7 +3068,7 @@ def answer_message(message, language="English", session_id=None):
         )
         session["chat_history"].append({"role": "bot", "message": reply})
         log_answer_return("general_banking_reference", session_id, reply, sources, {"topic": product_topic, "intent": intent})
-        return {
+        return finalize({
             "session_id": session_id,
             "reply": reply,
             "history": session["chat_history"],
@@ -2952,7 +3078,7 @@ def answer_message(message, language="English", session_id=None):
             "topic": product_topic.lower(),
             "rewritten_question": None,
             "search_methods": ["structured_general_banking"],
-        }
+        }, "general_banking_reference")
 
     if LIGHTWEIGHT_MODE and banking_related:
         logger.info("answer.route lightweight_official session_id=%s topic=%s intent=%s resolved=%s", session_id, topic or "", intent, log_text(resolved_question))
@@ -2961,7 +3087,7 @@ def answer_message(message, language="English", session_id=None):
             topic,
             intent,
             session=session,
-            follow_up=is_follow_up_question(search_question) or bool(session.get("last_kb_source") and topic == session.get("current_topic")),
+            follow_up=follow_up or bool(session.get("last_kb_source") and topic == session.get("current_topic")),
             current_query=search_question,
         )
         reply = translate_answer(reply, language)
@@ -2974,7 +3100,7 @@ def answer_message(message, language="English", session_id=None):
         )
         session["chat_history"].append({"role": "bot", "message": reply})
         log_answer_return("lightweight_official", session_id, reply, sources, {"topic": topic, "intent": intent})
-        return {
+        return finalize({
             "session_id": session_id,
             "reply": reply,
             "history": session["chat_history"],
@@ -2988,7 +3114,7 @@ def answer_message(message, language="English", session_id=None):
                 for source in sources
                 for method in source.get("search_methods", [])
             } | {"lightweight_official_kb"}),
-        }
+        }, "lightweight_official")
 
     clarifying_reply = build_clarifying_question(search_question, topic, intent, session)
     if clarifying_reply:
@@ -2997,14 +3123,14 @@ def answer_message(message, language="English", session_id=None):
         remember_conversation_context(session, topic, intent, resolved_question)
         session["chat_history"].append({"role": "bot", "message": reply})
         log_answer_return("clarifying_question", session_id, reply, [], {"topic": topic, "intent": intent})
-        return {
+        return finalize({
             "session_id": session_id,
             "reply": reply,
             "history": session["chat_history"],
             "sources": [],
             "suggested_questions": suggested_questions,
             "topic": topic,
-        }
+        }, "clarifying_question")
 
     if should_use_form_assistant(resolved_question, topic, intent):
         logger.info("answer.route form_assistant session_id=%s topic=%s intent=%s resolved=%s", session_id, topic or "", intent, log_text(resolved_question))
@@ -3013,14 +3139,14 @@ def answer_message(message, language="English", session_id=None):
         remember_conversation_context(session, topic, intent, resolved_question)
         session["chat_history"].append({"role": "bot", "message": reply})
         log_answer_return("form_assistant", session_id, reply, [], {"topic": topic, "intent": intent})
-        return {
+        return finalize({
             "session_id": session_id,
             "reply": reply,
             "history": session["chat_history"],
             "sources": [],
             "suggested_questions": suggested_questions,
             "topic": topic,
-        }
+        }, "form_assistant")
 
     if not banking_related:
         logger.info("answer.route banking_scope_guard session_id=%s question=%s", session_id, log_text(message))
@@ -3032,7 +3158,7 @@ def answer_message(message, language="English", session_id=None):
             "How do I activate net banking?",
         ], language)
         log_answer_return("banking_scope_guard", session_id, reply, [], {"restricted": True})
-        return {
+        return finalize({
             "session_id": session_id,
             "reply": reply,
             "history": session["chat_history"],
@@ -3042,7 +3168,7 @@ def answer_message(message, language="English", session_id=None):
             "restricted": True,
             "general_chat": False,
             "search_methods": ["banking_scope_guard"],
-        }
+        }, "banking_scope_guard")
 
     if LIGHTWEIGHT_MODE:
         logger.info("answer.route lightweight_official session_id=%s topic=%s intent=%s resolved=%s", session_id, topic or "", intent, log_text(resolved_question))
@@ -3051,7 +3177,7 @@ def answer_message(message, language="English", session_id=None):
             topic,
             intent,
             session=session,
-            follow_up=is_follow_up_question(search_question) or bool(session.get("last_kb_source") and topic == session.get("current_topic")),
+            follow_up=follow_up or bool(session.get("last_kb_source") and topic == session.get("current_topic")),
             current_query=search_question,
         )
         reply = translate_answer(reply, language)
@@ -3064,7 +3190,7 @@ def answer_message(message, language="English", session_id=None):
         )
         session["chat_history"].append({"role": "bot", "message": reply})
         log_answer_return("lightweight_official", session_id, reply, sources, {"topic": topic, "intent": intent})
-        return {
+        return finalize({
             "session_id": session_id,
             "reply": reply,
             "history": session["chat_history"],
@@ -3078,7 +3204,7 @@ def answer_message(message, language="English", session_id=None):
                 for source in sources
                 for method in source.get("search_methods", [])
             } | {"lightweight_official_kb"}),
-        }
+        }, "lightweight_official")
 
     banking_collection = load_vector_db()
     ready_models = get_ready_models()
@@ -3094,7 +3220,7 @@ def answer_message(message, language="English", session_id=None):
         remember_conversation_context(session, topic, intent, resolved_question)
         session["chat_history"].append({"role": "bot", "message": reply})
         log_answer_return("chroma_lightweight_fallback", session_id, reply, sources, {"topic": topic, "intent": intent})
-        return {
+        return finalize({
             "session_id": session_id,
             "reply": reply,
             "history": session["chat_history"],
@@ -3108,7 +3234,7 @@ def answer_message(message, language="English", session_id=None):
                 for source in sources
                 for method in source.get("search_methods", [])
             } | {"lightweight_fallback"}),
-        }
+        }, "chroma_lightweight_fallback")
 
     embedding_model, reranker_model, tokenizer, llm_model = ready_models
     rewritten_question = ""
@@ -3120,7 +3246,7 @@ def answer_message(message, language="English", session_id=None):
             reply = translate_answer(build_clarification_reply(session), language)
             session["chat_history"].append({"role": "bot", "message": reply})
             log_answer_return("clarification_after_rewrite", session_id, reply, [], {"topic": session.get("current_topic", "")})
-            return {
+            return finalize({
                 "session_id": session_id,
                 "reply": reply,
                 "history": session["chat_history"],
@@ -3128,7 +3254,7 @@ def answer_message(message, language="English", session_id=None):
                 "suggested_questions": translate_suggested_questions(build_suggested_questions(session.get("current_topic", "")), language),
                 "topic": session.get("current_topic", ""),
                 "needs_clarification": True,
-            }
+            }, "clarification_after_rewrite")
         resolved_question = resolve_question_context(rewritten_question, session)
         intent = detect_question_intent(resolved_question)
         if intent == "general" and is_follow_up_question(rewritten_question):
@@ -3191,7 +3317,7 @@ def answer_message(message, language="English", session_id=None):
     } | {"cross_encoder"})
 
     log_answer_return("llm_rag_or_exact", session_id, reply, sources, {"topic": topic, "intent": intent, "methods": used_search_methods})
-    return {
+    return finalize({
         "session_id": session_id,
         "reply": reply,
         "history": session["chat_history"],
@@ -3201,4 +3327,4 @@ def answer_message(message, language="English", session_id=None):
         "topic": topic,
         "rewritten_question": rewritten_question or None,
         "search_methods": used_search_methods,
-    }
+    }, "llm_rag_or_exact")
