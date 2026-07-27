@@ -19,3 +19,6 @@ frontend/.env.*
 data/chatbot_app.sqlite3
 *.sqlite3
 data/vector_db/
+
+# Local deployment bundles
+aws-banking-chatbot*.zip
